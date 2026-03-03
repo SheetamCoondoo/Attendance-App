@@ -4,3 +4,4 @@ qrcode
 Pillow
 tzdata
 openpyxl
+gunicorn

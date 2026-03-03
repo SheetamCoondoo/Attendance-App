@@ -8,7 +8,7 @@ On-prem attendance system with:
 - QR login/logout tools with webcam scan support
 - OTP alternative to QR scan (employee generates OTP, scanner submits employee code + OTP)
 
-## Run
+## Development Run
 
 ```powershell
 .\run.ps1
@@ -21,6 +21,84 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python app.py
+```
+
+## Production (Linux + Gunicorn + Nginx)
+
+Do not run `python app.py` in production. Use Gunicorn with the `wsgi.py` entrypoint.
+
+1. Clone + install:
+
+```bash
+cd /opt
+git clone https://github.com/SheetamCoondoo/Attendance-App.git attendance-app
+cd attendance-app
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+2. Set production environment variables:
+
+```bash
+cp .env.example .env
+```
+
+Set at least:
+- `APP_ENV=production`
+- `SECRET_KEY=<long random value>`
+- `TRUST_PROXY=1` (when running behind nginx)
+
+Then lock down the file:
+
+```bash
+chmod 600 .env
+```
+
+Generate a secret key example:
+
+```bash
+python3 -c "import secrets; print(secrets.token_urlsafe(64))"
+```
+
+3. Test Gunicorn locally on the server:
+
+```bash
+set -a
+source .env
+set +a
+.venv/bin/gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 wsgi:application
+```
+
+`workers=1` is intentional because SQLite is used.
+
+4. Install systemd service:
+
+```bash
+sudo cp deploy/systemd/attendance.service /etc/systemd/system/attendance.service
+sudo systemctl daemon-reload
+sudo systemctl enable attendance
+sudo systemctl start attendance
+sudo systemctl status attendance
+```
+
+5. Configure nginx reverse proxy:
+
+```bash
+sudo cp deploy/nginx/attendance.conf /etc/nginx/sites-available/attendance
+sudo ln -s /etc/nginx/sites-available/attendance /etc/nginx/sites-enabled/attendance
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+6. Deploy updates:
+
+```bash
+cd /opt/attendance-app
+git pull origin main
+source .venv/bin/activate
+pip install -r requirements.txt
+sudo systemctl restart attendance
 ```
 
 ## URLs

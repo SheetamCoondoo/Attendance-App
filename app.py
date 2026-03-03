@@ -16,6 +16,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 import qrcode
 from flask import Flask, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 from flask_cors import CORS
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -33,12 +34,26 @@ OTP_MAX_ATTEMPTS = 5
 BREAK_CUTOFF_HOUR = 4
 DEFAULT_EMPLOYEE_PIN = "1111"
 DEFAULT_ADMIN_PIN = "1234"
-SECRET_KEY = os.getenv("SECRET_KEY", "dev-change-this-secret")
+APP_ENV = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "development")).strip().lower()
+IS_PRODUCTION = APP_ENV == "production"
+SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
+if not SECRET_KEY:
+    if IS_PRODUCTION:
+        raise RuntimeError("SECRET_KEY environment variable is required when APP_ENV=production")
+    SECRET_KEY = "dev-change-this-secret"
 REQUIRE_OFFICE_NETWORK = os.getenv("REQUIRE_OFFICE_NETWORK", "0") == "1"
 ALLOWED_SUBNET = os.getenv("ALLOWED_SUBNET", "").strip()
+TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
 
 app = Flask(__name__)
-app.config["SECRET_KEY"] = SECRET_KEY
+app.config.update(
+    SECRET_KEY=SECRET_KEY,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=IS_PRODUCTION,
+)
+if TRUST_PROXY:
+    app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 CORS(app, supports_credentials=True)
 
 
@@ -1326,4 +1341,7 @@ def export_my_attendance_xlsx():
 init_db()
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8000"))
+    debug = os.getenv("FLASK_DEBUG", "0") == "1" and not IS_PRODUCTION
+    app.run(host=host, port=port, debug=debug)
