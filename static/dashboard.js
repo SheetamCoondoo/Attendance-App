@@ -65,6 +65,20 @@ function isoToLocalInput(v) {
   return v ? String(v).slice(0, 16) : "";
 }
 
+function formatDashboardDateTime(v) {
+  if (!v) return "";
+  const s = String(v).trim();
+  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})[T\s](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return s;
+  const yyyy = m[1];
+  const mm = m[2];
+  const dd = m[3];
+  const hh = m[4];
+  const min = m[5];
+  const sec = m[6] || "00";
+  return `${dd}-${mm}-${yyyy} / ${hh}:${min}:${sec}`;
+}
+
 function options(items, valueKey, labelKey, selected) {
   return (items || [])
     .map((x) => `<option value="${x[valueKey]}" ${String(x[valueKey]) === String(selected) ? "selected" : ""}>${x[labelKey]}</option>`)
@@ -85,12 +99,68 @@ async function doLogin(e) {
   location.href = out.redirect;
 }
 
-async function doLogout() {
+async function doSessionLogout() {
   await api("/auth/logout", { method: "POST" });
   location.href = "/login";
 }
 
 const adminState = { users: [], categories: [], shifts: [] };
+const employeeState = { canUpdateBreak: false, isSavingBreak: false };
+
+async function doEmployeeLogout() {
+  const breakSelect = qs("logoutBreakTaken");
+  if (employeeState.canUpdateBreak && breakSelect && breakSelect.value !== "") {
+    try {
+      await api("/api/employee/today-break", {
+        method: "POST",
+        body: JSON.stringify({ break_taken: Number(breakSelect.value) }),
+      });
+    } catch (e) {
+      alert(`Could not save break status: ${e.message}`);
+      return;
+    }
+  }
+  await doSessionLogout();
+}
+
+function setBreakStatusMessage(message) {
+  const statusText = qs("breakStatusMsg");
+  if (statusText) statusText.textContent = message;
+}
+
+async function saveEmployeeBreakStatus() {
+  const breakSelect = qs("logoutBreakTaken");
+  const saveBtn = qs("saveBreakBtn");
+  if (!breakSelect || !saveBtn) return;
+
+  if (!employeeState.canUpdateBreak) {
+    setBreakStatusMessage("No attendance row available for the active break date (4:00 AM cutoff).");
+    return;
+  }
+  if (breakSelect.value === "") {
+    alert("Please select Yes or No before saving break status.");
+    breakSelect.focus();
+    return;
+  }
+  if (employeeState.isSavingBreak) return;
+
+  employeeState.isSavingBreak = true;
+  saveBtn.disabled = true;
+  try {
+    await api("/api/employee/today-break", {
+      method: "POST",
+      body: JSON.stringify({ break_taken: Number(breakSelect.value) }),
+    });
+    setBreakStatusMessage("Break status saved successfully.");
+    await Promise.all([fetchEmployeeSummary(), fetchEmployeeAttendance(), loadEmployeeBreakStatus()]);
+  } catch (e) {
+    setBreakStatusMessage(`Unable to save break status: ${e.message}`);
+    alert(`Could not save break status: ${e.message}`);
+  } finally {
+    employeeState.isSavingBreak = false;
+    saveBtn.disabled = !employeeState.canUpdateBreak;
+  }
+}
 
 function mergedRangeQuery() {
   return `from=${qs("fromDate").value}&to=${qs("toDate").value}`;
@@ -119,7 +189,7 @@ async function loadAdmin() {
   qs("fromDate").value = r.from;
   qs("toDate").value = r.to;
 
-  qs("logoutBtn").onclick = doLogout;
+  qs("logoutBtn").onclick = doSessionLogout;
   qs("loadMergedBtn").onclick = loadMergedEmployeeView;
   qs("reloadTodayAttendance").onclick = loadTodayAttendance;
 
@@ -157,7 +227,7 @@ async function loadMergedEmployeeView() {
     tb.innerHTML = "";
     (d.attendance || []).forEach((i) => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${i.login_time || ""}</td><td>${i.logout_time || ""}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td>`;
+      tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td><td>${Number(i.break_taken || 0) === 1 ? "Yes" : "No"}</td>`;
       tb.appendChild(tr);
     });
     setMergedExportLink();
@@ -176,7 +246,7 @@ async function loadTodayAttendance() {
   tb.innerHTML = "";
   (d.items || []).forEach((i) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${i.employee_code || ""}</td><td>${i.attendance_date || ""}</td><td>${i.login_time || ""}</td><td>${i.logout_time || ""}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td>`;
+    tr.innerHTML = `<td>${i.employee_code || ""}</td><td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td><td>${Number(i.break_taken || 0) === 1 ? "Yes" : "No"}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -204,7 +274,12 @@ async function fetchUsers() {
       <td><select data-k="shift_id">${options(adminState.shifts, "id", "name", u.shift_id)}</select></td>
       <td><input type="checkbox" data-k="active" ${Number(u.active) === 1 ? "checked" : ""} /></td>
       <td><input data-k="pin" placeholder="New PIN" /></td>
-      <td><button data-user-id="${u.id}" type="button">Save</button></td>
+      <td>
+        <div class="row">
+          <button data-user-id="${u.id}" type="button">Save</button>
+          <button data-delete-user-id="${u.id}" type="button">Delete</button>
+        </div>
+      </td>
     `;
     tb.appendChild(tr);
   });
@@ -226,6 +301,23 @@ async function fetchUsers() {
       await api(`/api/admin/users/${userId}`, { method: "PUT", body: JSON.stringify(payload) });
       await fetchUsers();
       alert("User updated");
+    };
+  });
+
+  tb.querySelectorAll("button[data-delete-user-id]").forEach((b) => {
+    b.onclick = async () => {
+      const userId = Number(b.dataset.deleteUserId);
+      const u = adminState.users.find((x) => Number(x.id) === userId);
+      const label = (u && (u.employee_code || u.name)) || `ID ${userId}`;
+      if (!confirm(`Delete user ${label}? This will also delete their attendance history.`)) return;
+      await api(`/api/admin/users/${userId}`, { method: "DELETE" });
+      await Promise.all([fetchUsers(), loadTodayAttendance()]);
+      if (u && getMergedEmployeeCode().toUpperCase() === String(u.employee_code || "").toUpperCase()) {
+        qs("mergedSummary").innerHTML = "";
+        qs("mergedAttendanceTable").querySelector("tbody").innerHTML = "";
+        setMergedExportLink();
+      }
+      alert("User deleted");
     };
   });
 
@@ -262,7 +354,12 @@ async function fetchCategories() {
       <td>${c.id}</td>
       <td><input data-k="name" value="${c.name || ""}" /></td>
       <td><input data-k="required_hours" value="${c.required_hours || ""}" /></td>
-      <td><button data-category-id="${c.id}" type="button">Save</button></td>
+      <td>
+        <div class="row">
+          <button data-category-id="${c.id}" type="button">Save</button>
+          <button data-delete-category-id="${c.id}" type="button">Delete</button>
+        </div>
+      </td>
     `;
     tb.appendChild(tr);
   });
@@ -280,6 +377,18 @@ async function fetchCategories() {
       await fetchCategories();
       await fetchUsers();
       alert("Category updated");
+    };
+  });
+
+  tb.querySelectorAll("button[data-delete-category-id]").forEach((b) => {
+    b.onclick = async () => {
+      const categoryId = Number(b.dataset.deleteCategoryId);
+      const c = adminState.categories.find((x) => Number(x.id) === categoryId);
+      const label = (c && c.name) || `ID ${categoryId}`;
+      if (!confirm(`Delete category ${label}? Employees using it will be moved to another category.`)) return;
+      await api(`/api/admin/categories/${categoryId}`, { method: "DELETE" });
+      await Promise.all([fetchCategories(), fetchUsers()]);
+      alert("Category deleted");
     };
   });
 
@@ -310,7 +419,12 @@ async function fetchShifts() {
       <td><input data-k="start_time" value="${s.start_time || ""}" /></td>
       <td><input data-k="end_time" value="${s.end_time || ""}" /></td>
       <td><input data-k="grace_minutes" value="${s.grace_minutes || ""}" /></td>
-      <td><button data-shift-id="${s.id}" type="button">Save</button></td>
+      <td>
+        <div class="row">
+          <button data-shift-id="${s.id}" type="button">Save</button>
+          <button data-delete-shift-id="${s.id}" type="button">Delete</button>
+        </div>
+      </td>
     `;
     tb.appendChild(tr);
   });
@@ -330,6 +444,18 @@ async function fetchShifts() {
       await fetchShifts();
       await fetchUsers();
       alert("Shift updated");
+    };
+  });
+
+  tb.querySelectorAll("button[data-delete-shift-id]").forEach((b) => {
+    b.onclick = async () => {
+      const shiftId = Number(b.dataset.deleteShiftId);
+      const s = adminState.shifts.find((x) => Number(x.id) === shiftId);
+      const label = (s && s.name) || `ID ${shiftId}`;
+      if (!confirm(`Delete shift ${label}? Employees using it will be moved to another shift.`)) return;
+      await api(`/api/admin/shifts/${shiftId}`, { method: "DELETE" });
+      await Promise.all([fetchShifts(), fetchUsers()]);
+      alert("Shift deleted");
     };
   });
 
@@ -418,17 +544,46 @@ async function loadEmployee() {
   qs("fromDate").value = r.from;
   qs("toDate").value = r.to;
   qs("reloadAttendance").onclick = reloadEmployeeDashboard;
-  qs("logoutBtn").onclick = doLogout;
+  qs("logoutBtn").onclick = doEmployeeLogout;
+  qs("saveBreakBtn").onclick = saveEmployeeBreakStatus;
   await reloadEmployeeDashboard();
 }
 
+async function loadEmployeeBreakStatus() {
+  const breakSelect = qs("logoutBreakTaken");
+  const saveBtn = qs("saveBreakBtn");
+  if (!breakSelect || !saveBtn) return;
+
+  try {
+    const d = await api("/api/employee/today-break");
+    employeeState.canUpdateBreak = Boolean(d.can_update);
+    if (!employeeState.canUpdateBreak) {
+      breakSelect.value = "";
+      breakSelect.disabled = true;
+      saveBtn.disabled = true;
+      setBreakStatusMessage(`No attendance record for break date ${d.attendance_date} (4:00 AM cutoff).`);
+      return;
+    }
+
+    breakSelect.disabled = false;
+    breakSelect.value = d.break_taken === 1 ? "1" : "0";
+    saveBtn.disabled = employeeState.isSavingBreak;
+    setBreakStatusMessage(`Break status loaded for ${d.attendance_date} (4:00 AM cutoff). Change selection and click Save Break Status. Logout can also save selected value.`);
+  } catch (e) {
+    employeeState.canUpdateBreak = false;
+    breakSelect.value = "";
+    breakSelect.disabled = true;
+    saveBtn.disabled = true;
+    setBreakStatusMessage(`Unable to load break status: ${e.message}`);
+  }
+}
 function setEmployeeExportLink() {
   qs("myExportLink").href = `/api/employee/export.xlsx?from=${qs("fromDate").value}&to=${qs("toDate").value}`;
 }
 
 async function reloadEmployeeDashboard() {
   setEmployeeExportLink();
-  await Promise.all([fetchEmployeeSummary(), fetchEmployeeAttendance()]);
+  await Promise.all([fetchEmployeeSummary(), fetchEmployeeAttendance(), loadEmployeeBreakStatus()]);
 }
 
 async function fetchEmployeeSummary() {
@@ -442,7 +597,7 @@ async function fetchEmployeeAttendance() {
   tb.innerHTML = "";
   (d.items || []).forEach((i) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${i.id}</td><td>${i.attendance_date || ""}</td><td>${i.login_time || ""}</td><td>${i.logout_time || ""}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td><td>${(i.break_taken || 0) === 1 ? "Yes" : "No"}</td><td>${i.status || ""}</td>`;
+    tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${kpiValue(i.late_mark)}</td><td>${(i.break_taken || 0) === 1 ? "Yes" : "No"}</td><td>${i.status || ""}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -461,3 +616,4 @@ window.addEventListener("DOMContentLoaded", async () => {
     else alert(e.message);
   }
 });
+

@@ -1,4 +1,11 @@
+const scanModeSelect = document.getElementById("scanMode");
+const qrModeSection = document.getElementById("qrModeSection");
+const otpModeSection = document.getElementById("otpModeSection");
 const sessionInput = document.getElementById("session");
+const otpEmployeeCodeInput = document.getElementById("otpEmployeeCode");
+const otpCodeInput = document.getElementById("otpCode");
+const scanQrBtn = document.getElementById("scanQrBtn");
+const scanOtpBtn = document.getElementById("scanOtpBtn");
 const statusEl = document.getElementById("status");
 const previewVideo = document.getElementById("preview");
 const captureCanvas = document.getElementById("captureCanvas");
@@ -11,6 +18,10 @@ let barcodeDetector = null;
 
 if ("BarcodeDetector" in window) {
   barcodeDetector = new BarcodeDetector({ formats: ["qr_code"] });
+}
+
+function currentMode() {
+  return scanModeSelect ? scanModeSelect.value : "qr";
 }
 
 function setStatus(message) {
@@ -33,24 +44,54 @@ function parseSessionId(rawValue) {
   return String(rawValue).trim();
 }
 
-async function sendScan(sessionId) {
+async function sendScan(payload) {
   const response = await fetch("/scan", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ session_id: sessionId }),
+    body: JSON.stringify(payload),
   });
   const data = await response.json();
-  setStatus(data.message || "Scan completed.");
-  alert(data.message || "Done");
+  const message = data.message || "Scan completed.";
+  setStatus(message);
+  if (!response.ok) {
+    alert(message);
+    return false;
+  }
+  alert(message);
+  return true;
 }
 
-async function scan() {
-  const sessionId = sessionInput.value.trim();
-  if (!sessionId) {
-    setStatus("Enter a session ID first.");
+async function submitQr() {
+  const raw = sessionInput.value.trim();
+  if (!raw) {
+    setStatus("Enter a session token first.");
     return;
   }
-  await sendScan(sessionId);
+  const sessionId = parseSessionId(raw);
+  if (!sessionId) {
+    setStatus("Invalid QR/session payload.");
+    return;
+  }
+  sessionInput.value = sessionId;
+  await sendScan({ session_id: sessionId });
+}
+
+async function submitOtp() {
+  const employeeCode = (otpEmployeeCodeInput.value || "").trim().toUpperCase();
+  const otpCode = (otpCodeInput.value || "").trim();
+  if (!employeeCode) {
+    setStatus("Enter employee code.");
+    return;
+  }
+  if (!/^\d{6}$/.test(otpCode)) {
+    setStatus("OTP must be exactly 6 digits.");
+    return;
+  }
+  otpEmployeeCodeInput.value = employeeCode;
+  const ok = await sendScan({ employee_code: employeeCode, otp_code: otpCode });
+  if (ok) {
+    otpCodeInput.value = "";
+  }
 }
 
 function detectFromJsQr() {
@@ -63,9 +104,12 @@ function detectFromJsQr() {
 
 async function detectFrame() {
   if (!scanning) return;
+  if (currentMode() !== "qr") {
+    stopCamera();
+    return;
+  }
 
   let rawValue = "";
-
   if (barcodeDetector) {
     const codes = await barcodeDetector.detect(previewVideo);
     if (codes.length > 0) {
@@ -81,20 +125,22 @@ async function detectFrame() {
       sessionInput.value = sessionId;
       setStatus("QR detected. Submitting...");
       stopCamera();
-      await sendScan(sessionId);
+      await sendScan({ session_id: sessionId });
       return;
     }
   }
-
   requestAnimationFrame(detectFrame);
 }
 
 async function startCamera() {
+  if (currentMode() !== "qr") {
+    setStatus("Switch mode to QR Scan to use camera.");
+    return;
+  }
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
     setStatus("Camera access is not supported in this browser.");
     return;
   }
-
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: "environment" },
@@ -106,7 +152,7 @@ async function startCamera() {
     stopCamBtn.disabled = false;
     setStatus("Camera started. Show QR code to scan.");
     requestAnimationFrame(detectFrame);
-  } catch (error) {
+  } catch (_error) {
     setStatus("Camera permission denied or unavailable.");
   }
 }
@@ -122,10 +168,33 @@ function stopCamera() {
   stopCamBtn.disabled = true;
 }
 
+function applyMode() {
+  const mode = currentMode();
+  const isQrMode = mode === "qr";
+  qrModeSection.style.display = isQrMode ? "block" : "none";
+  otpModeSection.style.display = isQrMode ? "none" : "block";
+  if (!isQrMode) {
+    stopCamera();
+    setStatus("OTP mode active. Enter employee code and OTP.");
+  } else {
+    setStatus("QR mode active. Paste session token or use camera.");
+  }
+}
+
+scanQrBtn.addEventListener("click", submitQr);
+scanOtpBtn.addEventListener("click", submitOtp);
 startCamBtn.addEventListener("click", startCamera);
 stopCamBtn.addEventListener("click", () => {
   stopCamera();
   setStatus("Camera stopped.");
 });
+scanModeSelect.addEventListener("change", applyMode);
+otpCodeInput.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    event.preventDefault();
+    submitOtp();
+  }
+});
 
-window.scan = scan;
+applyMode();
+window.scan = submitQr;

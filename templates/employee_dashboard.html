@@ -16,12 +16,25 @@
   </header>
   <main class="grid one">
     <section class="card span-4"><h3>My Summary</h3><div id="empSummary" class="kpi-grid"></div></section>
-    <section class="card span-8">
+    <section class="card span-4">
+      <h3>Break Status At Logout</h3>
+      <div class="row wrap">
+        <select id="logoutBreakTaken">
+          <option value="">Select break status</option>
+          <option value="1">Yes, I took a break</option>
+          <option value="0">No break taken</option>
+        </select>
+        <button id="saveBreakBtn" type="button">Save Break Status</button>
+      </div>
+      <p id="breakStatusMsg" class="muted">Save break status anytime. Logout can also save selected value optionally.</p>
+    </section>
+    <section class="card span-12">
       <h3>My Attendance</h3>
       <div class="row wrap"><input id="fromDate" type="date" /><input id="toDate" type="date" /><button id="reloadAttendance">Load</button><a id="myExportLink" href="#" target="_blank" rel="noopener">Download XLSX</a></div>
-      <div class="table-wrap"><table id="attendanceTable"><thead><tr><th>ID</th><th>Date</th><th>Login</th><th>Logout</th><th>Hours</th><th>OT</th><th>Late</th><th>Break</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+      <div class="table-wrap"><table id="attendanceTable"><thead><tr><th>Date</th><th>Login</th><th>Logout</th><th>Hours</th><th>OT</th><th>Late</th><th>Break</th><th>Status</th></tr></thead><tbody></tbody></table></div>
     </section>
   </main>
   <script src="/static/dashboard.js"></script>
 </body>
 </html>
+

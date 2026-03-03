@@ -1,8 +1,11 @@
 
 import base64
+import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import sqlite3
 import uuid
 from datetime import date, datetime, time, timedelta, timezone
@@ -24,7 +27,10 @@ try:
 except ZoneInfoNotFoundError:
     IST = timezone(timedelta(hours=5, minutes=30))
 
-QR_TTL_SECONDS = 60
+QR_TTL_SECONDS = 300
+OTP_LENGTH = 6
+OTP_MAX_ATTEMPTS = 5
+BREAK_CUTOFF_HOUR = 4
 DEFAULT_EMPLOYEE_PIN = "1111"
 DEFAULT_ADMIN_PIN = "1234"
 SECRET_KEY = os.getenv("SECRET_KEY", "dev-change-this-secret")
@@ -66,8 +72,24 @@ def now_iso():
     return now_ist().isoformat()
 
 
+def break_effective_date_ist(dt=None):
+    local_now = dt or now_ist()
+    if local_now.hour < BREAK_CUTOFF_HOUR:
+        return local_now.date() - timedelta(days=1)
+    return local_now.date()
+
+
 def epoch_ms():
     return int(now_ist().timestamp() * 1000)
+
+
+def generate_otp_code():
+    return f"{secrets.randbelow(10 ** OTP_LENGTH):0{OTP_LENGTH}d}"
+
+
+def otp_digest(otp_code, session_id):
+    payload = f"{session_id}:{otp_code}".encode("utf-8")
+    return hmac.new(SECRET_KEY.encode("utf-8"), payload, hashlib.sha256).hexdigest()
 
 
 def parse_dt(v):
@@ -160,6 +182,35 @@ def calc_metrics(login_iso, logout_iso, profile):
         "late_mark": late,
         "status": status,
     }
+
+
+def execute_attendance_session_action(conn, user_id, purpose, action_iso):
+    if purpose == "login":
+        day = now_ist().date().isoformat()
+        open_row = conn.execute("SELECT id FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        if open_row:
+            return {"message": "User already logged in"}, 400
+
+        today = conn.execute("SELECT id,login_time,logout_time FROM attendance WHERE user_id=? AND attendance_date=?", (user_id, day)).fetchone()
+        if today and today["login_time"] and today["logout_time"]:
+            return {"message": "Attendance already captured for today"}, 400
+
+        if today and not today["login_time"]:
+            conn.execute("UPDATE attendance SET login_time=?,status='PRESENT',system_logout=0,updated_at=? WHERE id=?", (action_iso, action_iso, today["id"]))
+        else:
+            conn.execute("INSERT INTO attendance (user_id,attendance_date,login_time,status,created_at,updated_at) VALUES (?,?,?,'PRESENT',?,?)", (user_id, day, action_iso, action_iso, action_iso))
+        return {"message": "Login Recorded"}, 200
+
+    if purpose == "logout":
+        rec = conn.execute("SELECT * FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        if not rec:
+            return {"message": "No login found"}, 400
+        profile = user_profile(conn, user_id)
+        m = calc_metrics(rec["login_time"], action_iso, profile)
+        conn.execute("UPDATE attendance SET logout_time=?,total_hours=?,overtime=?,late_mark=?,status=?,updated_at=? WHERE id=?", (action_iso, m["total_hours"], m["overtime"], m["late_mark"], m["status"], action_iso, rec["id"]))
+        return {"message": "Logout Recorded", "metrics": m}, 200
+
+    return {"message": "Invalid or expired credential"}, 400
 
 
 def rebuild_schema_if_needed(conn):
@@ -272,9 +323,10 @@ def init_db():
             CREATE TABLE IF NOT EXISTS shifts(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,grace_minutes INTEGER NOT NULL DEFAULT 15);
             CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT,role TEXT NOT NULL DEFAULT 'EMPLOYEE',employee_code TEXT,pin_hash TEXT,category_id INTEGER,shift_id INTEGER,category_hours INTEGER,active INTEGER NOT NULL DEFAULT 1,created_at TEXT);
             CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,attendance_date TEXT NOT NULL,login_time TEXT,logout_time TEXT,total_hours REAL,overtime REAL,late_mark INTEGER NOT NULL DEFAULT 0,break_taken INTEGER NOT NULL DEFAULT 0,status TEXT NOT NULL DEFAULT 'PRESENT',system_logout INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT,UNIQUE(user_id,attendance_date));
-            CREATE TABLE IF NOT EXISTS qr_sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,purpose TEXT NOT NULL,expires_at INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS qr_sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,purpose TEXT NOT NULL,expires_at INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,otp_hash TEXT,otp_failed_attempts INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
             CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id,attendance_date);
             CREATE INDEX IF NOT EXISTS idx_attendance_status_date ON attendance(status,attendance_date);
+            CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at);
             """
         )
         rebuild_schema_if_needed(conn)
@@ -294,7 +346,10 @@ def init_db():
         ensure_col(conn, "attendance", "created_at", "TEXT")
         ensure_col(conn, "attendance", "updated_at", "TEXT")
         ensure_col(conn, "qr_sessions", "created_at", "TEXT")
+        ensure_col(conn, "qr_sessions", "otp_hash", "TEXT")
+        ensure_col(conn, "qr_sessions", "otp_failed_attempts", "INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at)")
         conn.execute("INSERT OR IGNORE INTO employee_categories (id,name,required_hours) VALUES (1,'General',9)")
         conn.execute("INSERT OR IGNORE INTO shifts (id,name,start_time,end_time,grace_minutes) VALUES (1,'General Shift','09:00','18:00',15)")
         conn.execute("INSERT OR IGNORE INTO users (id,name,role,employee_code,category_id,shift_id,category_hours,active,created_at) VALUES (1,'Employee1','EMPLOYEE','EMP001',1,1,9,1,?)", (now_iso(),))
@@ -310,6 +365,7 @@ def init_db():
         conn.execute("UPDATE attendance SET attendance_date=COALESCE(attendance_date,substr(login_time,1,10),substr(created_at,1,10),?) WHERE attendance_date IS NULL", (now_ist().date().isoformat(),))
         conn.execute("UPDATE attendance SET created_at=COALESCE(created_at,login_time,?),updated_at=COALESCE(updated_at,logout_time,login_time,?) WHERE created_at IS NULL OR updated_at IS NULL", (now_iso(), now_iso()))
         conn.execute("UPDATE qr_sessions SET created_at=COALESCE(created_at,?) WHERE created_at IS NULL", (now_iso(),))
+        conn.execute("UPDATE qr_sessions SET otp_failed_attempts=COALESCE(otp_failed_attempts,0) WHERE otp_failed_attempts IS NULL")
 
 
 def auth_user():
@@ -386,6 +442,7 @@ def scanner_page():
 
 
 @app.get("/employee.html")
+@html_guard("EMPLOYEE")
 def employee_tool_page():
     return send_from_directory(PUBLIC_DIR, "employee.html")
 
@@ -471,29 +528,44 @@ def auth_me():
     return jsonify({"user": {"id": int(u["id"]), "name": u["name"], "role": u["role"], "employee_code": u["employee_code"]}})
 
 @app.post("/generate-qr")
+@api_guard("EMPLOYEE")
 def generate_qr():
-    chk = office_check()
-    if chk:
-        return chk
+    u = request.current_user
     data = request.get_json(silent=True) or {}
-    user_id = data.get("user_id")
     purpose = str(data.get("purpose", "")).strip().lower()
-    if not isinstance(user_id, int) or purpose not in {"login", "logout"}:
+    if purpose not in {"login", "logout"}:
         return jsonify({"message": "Invalid request payload"}), 400
 
+    user_id = int(u["id"])
     token = str(uuid.uuid4())
-    expires = epoch_ms() + QR_TTL_SECONDS * 1000
+    otp_code = generate_otp_code()
+    nowms = epoch_ms()
+    expires = nowms + QR_TTL_SECONDS * 1000
     with conn_db() as conn:
         if not user_profile(conn, user_id):
             return jsonify({"message": "User not found or inactive"}), 404
-        conn.execute("INSERT INTO qr_sessions (id,user_id,purpose,expires_at,used,created_at) VALUES (?,?,?,?,0,?)", (token, user_id, purpose, expires, now_iso()))
+        conn.execute("UPDATE qr_sessions SET used=1 WHERE user_id=? AND used=0 AND expires_at>=?", (user_id, nowms))
+        conn.execute(
+            "INSERT INTO qr_sessions (id,user_id,purpose,expires_at,used,otp_hash,otp_failed_attempts,created_at) VALUES (?,?,?,?,0,?,?,?)",
+            (token, user_id, purpose, expires, otp_digest(otp_code, token), 0, now_iso()),
+        )
     payload = {"user_id": user_id, "session_token": token}
     qr_text = json.dumps(payload)
     img = qrcode.make(qr_text)
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     qr = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
-    return jsonify({"qr": qr, "session_id": token, "session_token": token, "expires_in_seconds": QR_TTL_SECONDS})
+    return jsonify(
+        {
+            "qr": qr,
+            "session_id": token,
+            "session_token": token,
+            "otp_code": otp_code,
+            "expires_in_seconds": QR_TTL_SECONDS,
+            "employee_code": u["employee_code"],
+            "employee_name": u["name"],
+        }
+    )
 
 
 @app.post("/scan")
@@ -502,47 +574,67 @@ def scan_qr():
     if chk:
         return chk
     data = request.get_json(silent=True) or {}
-    token = (data.get("session_token") or data.get("session_id") or "").strip()
-    if not token:
-        return jsonify({"message": "Invalid or expired QR"}), 400
+    token = str((data.get("session_token") or data.get("session_id") or "")).strip()
+    employee_code = str(data.get("employee_code", "")).strip()
+    otp_code = str(data.get("otp_code", "")).strip()
+    qr_mode = bool(token)
+    otp_mode = bool(employee_code or otp_code)
+
+    if qr_mode and otp_mode:
+        return jsonify({"message": "Provide either QR session token or employee_code + otp_code"}), 400
+    if not qr_mode and not otp_mode:
+        return jsonify({"message": "Provide either QR session token or employee_code + otp_code"}), 400
+    if otp_mode:
+        if not employee_code or not otp_code:
+            return jsonify({"message": "employee_code and otp_code are required"}), 400
+        if not otp_code.isdigit() or len(otp_code) != OTP_LENGTH:
+            return jsonify({"message": f"otp_code must be {OTP_LENGTH} digits"}), 400
 
     nowms = epoch_ms()
     niso = now_iso()
     with conn_db() as conn:
-        qr = conn.execute("SELECT * FROM qr_sessions WHERE id=?", (token,)).fetchone()
-        if not qr or int(qr["used"]) == 1 or int(qr["expires_at"]) < nowms:
-            return jsonify({"message": "Invalid or expired QR"}), 400
+        if qr_mode:
+            qr = conn.execute("SELECT * FROM qr_sessions WHERE id=?", (token,)).fetchone()
+            if not qr or int(qr["used"]) == 1 or int(qr["expires_at"]) < nowms:
+                return jsonify({"message": "Invalid or expired credential"}), 400
+            conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (token,))
+            payload, status = execute_attendance_session_action(conn, int(qr["user_id"]), str(qr["purpose"]).lower(), niso)
+            return jsonify(payload), status
 
-        uid = int(qr["user_id"])
-        purpose = str(qr["purpose"]).lower()
-        conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (token,))
+        user = conn.execute("SELECT id FROM users WHERE UPPER(employee_code)=UPPER(?) AND active=1", (employee_code,)).fetchone()
+        if not user:
+            return jsonify({"message": "Invalid employee code or OTP"}), 400
+        uid = int(user["id"])
+        qr = conn.execute(
+            """
+            SELECT * FROM qr_sessions
+            WHERE user_id=? AND used=0 AND expires_at>=?
+            ORDER BY created_at DESC LIMIT 1
+            """,
+            (uid, nowms),
+        ).fetchone()
+        if not qr or not qr["otp_hash"]:
+            return jsonify({"message": "Invalid employee code or OTP"}), 400
 
-        if purpose == "login":
-            d = now_ist().date().isoformat()
-            open_row = conn.execute("SELECT id FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-            if open_row:
-                return jsonify({"message": "User already logged in"}), 400
+        attempts = int(qr["otp_failed_attempts"] or 0)
+        if attempts >= OTP_MAX_ATTEMPTS:
+            conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (qr["id"],))
+            return jsonify({"message": "OTP locked. Generate a new QR/OTP."}), 400
 
-            today = conn.execute("SELECT id,login_time,logout_time FROM attendance WHERE user_id=? AND attendance_date=?", (uid, d)).fetchone()
-            if today and today["login_time"] and today["logout_time"]:
-                return jsonify({"message": "Attendance already captured for today"}), 400
+        expected = str(qr["otp_hash"])
+        actual = otp_digest(otp_code, str(qr["id"]))
+        if not hmac.compare_digest(actual, expected):
+            new_attempts = attempts + 1
+            locked = new_attempts >= OTP_MAX_ATTEMPTS
+            conn.execute("UPDATE qr_sessions SET otp_failed_attempts=?,used=? WHERE id=?", (new_attempts, 1 if locked else 0, qr["id"]))
+            if locked:
+                return jsonify({"message": "OTP locked after too many failed attempts. Generate a new QR/OTP."}), 400
+            remaining = OTP_MAX_ATTEMPTS - new_attempts
+            return jsonify({"message": f"Invalid OTP. {remaining} attempt(s) remaining."}), 400
 
-            if today and not today["login_time"]:
-                conn.execute("UPDATE attendance SET login_time=?,status='PRESENT',system_logout=0,updated_at=? WHERE id=?", (niso, niso, today["id"]))
-            else:
-                conn.execute("INSERT INTO attendance (user_id,attendance_date,login_time,status,created_at,updated_at) VALUES (?,?,?,'PRESENT',?,?)", (uid, d, niso, niso, niso))
-            return jsonify({"message": "Login Recorded"})
-
-        if purpose == "logout":
-            rec = conn.execute("SELECT * FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (uid,)).fetchone()
-            if not rec:
-                return jsonify({"message": "No login found"}), 400
-            profile = user_profile(conn, uid)
-            m = calc_metrics(rec["login_time"], niso, profile)
-            conn.execute("UPDATE attendance SET logout_time=?,total_hours=?,overtime=?,late_mark=?,status=?,updated_at=? WHERE id=?", (niso, m["total_hours"], m["overtime"], m["late_mark"], m["status"], niso, rec["id"]))
-            return jsonify({"message": "Logout Recorded", "metrics": m})
-
-        return jsonify({"message": "Invalid or expired QR"}), 400
+        conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (qr["id"],))
+        payload, status = execute_attendance_session_action(conn, uid, str(qr["purpose"]).lower(), niso)
+        return jsonify(payload), status
 
 
 @app.post("/admin/run-midnight-close")
@@ -651,7 +743,7 @@ def admin_summary():
     with conn_db() as conn:
         row = conn.execute(
             """
-            SELECT COUNT(*) total_days_worked,
+            SELECT SUM(CASE WHEN login_time IS NOT NULL THEN 1 ELSE 0 END) total_days_worked,
             SUM(CASE WHEN status='ABSENT' THEN 1 ELSE 0 END) absent_count,
             SUM(CASE WHEN late_mark=1 THEN 1 ELSE 0 END) late_count,
             SUM(COALESCE(total_hours,0)) total_hours,
@@ -911,12 +1003,12 @@ def my_summary():
 @api_guard("EMPLOYEE")
 def employee_today_break():
     u = request.current_user
-    today = now_ist().date().isoformat()
+    effective_day = break_effective_date_ist().isoformat()
     with conn_db() as conn:
-        row = conn.execute("SELECT id,attendance_date,break_taken FROM attendance WHERE user_id=? AND attendance_date=? ORDER BY id DESC LIMIT 1", (u["id"], today)).fetchone()
+        row = conn.execute("SELECT id,attendance_date,break_taken FROM attendance WHERE user_id=? AND attendance_date=? ORDER BY id DESC LIMIT 1", (u["id"], effective_day)).fetchone()
     if not row:
-        return jsonify({"attendance_date": today, "break_taken": None, "can_update": False})
-    return jsonify({"attendance_date": row["attendance_date"], "break_taken": int(row["break_taken"] or 0), "can_update": True})
+        return jsonify({"attendance_date": effective_day, "break_taken": None, "can_update": False})
+    return jsonify({"attendance_date": effective_day, "break_taken": int(row["break_taken"] or 0), "can_update": True})
 
 
 @app.post("/api/employee/today-break")
@@ -934,14 +1026,14 @@ def employee_today_break_update():
     else:
         return jsonify({"message": "break_taken must be true/false"}), 400
 
-    today = now_ist().date().isoformat()
+    effective_day = break_effective_date_ist().isoformat()
     with conn_db() as conn:
-        row = conn.execute("SELECT * FROM attendance WHERE user_id=? AND attendance_date=? ORDER BY id DESC LIMIT 1", (u["id"], today)).fetchone()
+        row = conn.execute("SELECT * FROM attendance WHERE user_id=? AND attendance_date=? ORDER BY id DESC LIMIT 1", (u["id"], effective_day)).fetchone()
         if not row:
-            return jsonify({"message": "No attendance record found for today"}), 400
+            return jsonify({"message": f"No attendance record found for break date {effective_day} (4:00 AM cutoff)"}), 400
         conn.execute("UPDATE attendance SET break_taken=?,updated_at=? WHERE id=?", (break_taken, now_iso(), row["id"]))
         conn.commit()
-    return jsonify({"message": "Break status updated", "attendance_date": today, "break_taken": break_taken})
+    return jsonify({"message": "Break status updated", "attendance_date": effective_day, "break_taken": break_taken})
 
 
 @app.get("/api/admin/users")
@@ -1009,6 +1101,27 @@ def users_update(user_id):
     return jsonify({"message": "User updated"})
 
 
+@app.delete("/api/admin/users/<int:user_id>")
+@api_guard("ADMIN")
+def users_delete(user_id):
+    current = request.current_user
+    with conn_db() as conn:
+        user = conn.execute("SELECT id,role FROM users WHERE id=?", (user_id,)).fetchone()
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+        if int(user["id"]) == int(current["id"]):
+            return jsonify({"message": "You cannot delete your own account"}), 400
+        if user["role"] == "ADMIN":
+            active_admins_left = conn.execute("SELECT COUNT(*) cnt FROM users WHERE role='ADMIN' AND active=1 AND id<>?", (user_id,)).fetchone()["cnt"]
+            if int(active_admins_left or 0) < 1:
+                return jsonify({"message": "Cannot delete the last active admin"}), 400
+        conn.execute("DELETE FROM attendance WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM qr_sessions WHERE user_id=?", (user_id,))
+        conn.execute("DELETE FROM users WHERE id=?", (user_id,))
+        conn.commit()
+    return jsonify({"message": "User deleted"})
+
+
 @app.get("/api/admin/categories")
 @api_guard("ADMIN")
 def categories_list():
@@ -1048,6 +1161,23 @@ def categories_update(category_id):
         except sqlite3.IntegrityError as e:
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Category updated"})
+
+
+@app.delete("/api/admin/categories/<int:category_id>")
+@api_guard("ADMIN")
+def categories_delete(category_id):
+    with conn_db() as conn:
+        row = conn.execute("SELECT id FROM employee_categories WHERE id=?", (category_id,)).fetchone()
+        if not row:
+            return jsonify({"message": "Category not found"}), 404
+        fallback = conn.execute("SELECT id FROM employee_categories WHERE id<>? ORDER BY id LIMIT 1", (category_id,)).fetchone()
+        if not fallback:
+            return jsonify({"message": "Cannot delete the last remaining category"}), 400
+        fallback_id = int(fallback["id"])
+        conn.execute("UPDATE users SET category_id=? WHERE category_id=?", (fallback_id, category_id))
+        conn.execute("DELETE FROM employee_categories WHERE id=?", (category_id,))
+        conn.commit()
+    return jsonify({"message": "Category deleted", "fallback_category_id": fallback_id})
 
 
 @app.get("/api/admin/shifts")
@@ -1091,6 +1221,23 @@ def shifts_update(shift_id):
         except sqlite3.IntegrityError as e:
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Shift updated"})
+
+
+@app.delete("/api/admin/shifts/<int:shift_id>")
+@api_guard("ADMIN")
+def shifts_delete(shift_id):
+    with conn_db() as conn:
+        row = conn.execute("SELECT id FROM shifts WHERE id=?", (shift_id,)).fetchone()
+        if not row:
+            return jsonify({"message": "Shift not found"}), 404
+        fallback = conn.execute("SELECT id FROM shifts WHERE id<>? ORDER BY id LIMIT 1", (shift_id,)).fetchone()
+        if not fallback:
+            return jsonify({"message": "Cannot delete the last remaining shift"}), 400
+        fallback_id = int(fallback["id"])
+        conn.execute("UPDATE users SET shift_id=? WHERE shift_id=?", (fallback_id, shift_id))
+        conn.execute("DELETE FROM shifts WHERE id=?", (shift_id,))
+        conn.commit()
+    return jsonify({"message": "Shift deleted", "fallback_shift_id": fallback_id})
 
 def recalc_attendance(conn, attendance_id):
     a = conn.execute("SELECT * FROM attendance WHERE id=?", (attendance_id,)).fetchone()

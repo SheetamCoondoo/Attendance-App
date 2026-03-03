@@ -6,6 +6,7 @@ On-prem attendance system with:
 - Admin dashboard (attendance, users, categories, shifts, approvals, audit, XLSX export)
 - Employee dashboard (summary, history, edit requests)
 - QR login/logout tools with webcam scan support
+- OTP alternative to QR scan (employee generates OTP, scanner submits employee code + OTP)
 
 ## Run
 
@@ -46,3 +47,32 @@ python app.py
 - Management: `/api/admin/users`, `/api/admin/categories`, `/api/admin/shifts`
 - Edit Workflow: `/api/employee/edit-requests`, `/api/admin/edit-requests`
 - Audit + Export: `/api/admin/audit`, `/api/admin/export.xlsx`
+
+## QR + OTP Scan Modes
+
+- `POST /generate-qr`
+  - Request (employee-authenticated): `{ "purpose": "login" | "logout" }`
+  - Credential is always bound to the currently logged-in employee session.
+  - Response includes:
+    - `qr` (image data URI)
+    - `session_id` / `session_token`
+    - `otp_code` (6-digit OTP)
+    - `expires_in_seconds`
+    - `employee_code`, `employee_name`
+
+- `POST /scan` supports exactly one mode per request:
+  - QR mode (existing): `{ "session_id": "<token>" }` or `{ "session_token": "<token>" }`
+  - OTP mode (new): `{ "employee_code": "EMP001", "otp_code": "123456" }`
+
+- OTP rules:
+  - Single-use
+  - Expires with session TTL
+  - Locked after 5 failed attempts
+  - Generating a new QR/OTP invalidates prior active code for that employee
+
+## Break Status Cutoff
+
+- Employee break status (`/api/employee/today-break`) uses a `4:00 AM IST` day cutoff.
+- Before `04:00`, break save/load maps to the previous date.
+- At or after `04:00`, break save/load maps to the current date.
+- This cutoff applies only to break-status save/load, not to attendance login/logout capture.
