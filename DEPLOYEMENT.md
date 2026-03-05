@@ -1,6 +1,6 @@
 # Attendance App Deployment Guide
 ## Scratch → Production → Go-Live (Using Cloudflare Tunnel)
-```
+
 This guide explains how to deploy the **Attendance App** so it can be accessed securely from **multiple office locations** over the internet.
 
 The system runs on a **Linux server inside a VirtualBox VM** located in **Office A**.
@@ -9,7 +9,6 @@ Employees from **Office A, Office B, and Office C** access the system through a 
 
 ---
 
-```
 # System Architecture
 ```
 Employees (Office A / B / C)
