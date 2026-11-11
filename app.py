@@ -5,25 +5,40 @@ import hmac
 import ipaddress
 import io
 import json
+import logging
+import math
 import os
 import secrets
-import sqlite3
 import uuid
+from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from functools import wraps
 from pathlib import Path
+from threading import Lock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+import importlib.metadata
+from urllib.parse import urlparse
+
+import libsql_client
 import qrcode
-import requests
-from flask import Flask, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
+from flask import Flask, g, has_request_context, jsonify, redirect, render_template, request, send_file, send_from_directory, session, url_for
 from flask_cors import CORS
+from werkzeug.exceptions import HTTPException
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash, generate_password_hash
 
+def env_flag(name, default=False):
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 BASE_DIR = Path(__file__).resolve().parent
-DB_PATH = BASE_DIR / "database.db"
-PUBLIC_DIR = BASE_DIR / "public"
+PUBLIC_DIR = (BASE_DIR / "public").resolve()
+TEMPLATE_DIR = (BASE_DIR / "templates").resolve()
+STATIC_DIR = (BASE_DIR / "static").resolve()
 
 try:
     IST = ZoneInfo("Asia/Kolkata")
@@ -36,26 +51,78 @@ OTP_MAX_ATTEMPTS = 5
 BREAK_CUTOFF_HOUR = 4
 DEFAULT_EMPLOYEE_PIN = "1111"
 DEFAULT_ADMIN_PIN = "1234"
-APP_ENV = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "development")).strip().lower()
-IS_PRODUCTION = APP_ENV == "production"
-SECRET_KEY = os.getenv("SECRET_KEY", "").strip()
-if not SECRET_KEY:
-    if IS_PRODUCTION:
-        raise RuntimeError("SECRET_KEY environment variable is required when APP_ENV=production")
-    SECRET_KEY = "dev-change-this-secret"
-REQUIRE_OFFICE_NETWORK = os.getenv("REQUIRE_OFFICE_NETWORK", "0") == "1"
-ALLOWED_SUBNET = os.getenv("ALLOWED_SUBNET", "").strip()
-ALLOWED_SUBNETS = os.getenv("ALLOWED_SUBNETS", "").strip()
-ALLOW_ADMIN_FROM_ANYWHERE = os.getenv("ALLOW_ADMIN_FROM_ANYWHERE", "1") == "1"
-TRUST_PROXY = os.getenv("TRUST_PROXY", "0") == "1"
+DB_READY_LOCK = Lock()
+DB_SCHEMA_READY = False
+
+
+@dataclass(frozen=True)
+class RuntimeSettings:
+    app_env: str
+    is_production: bool
+    is_vercel: bool
+    secret_key: str
+    secret_key_configured: bool
+    turso_database_url: str
+    turso_auth_token: str
+    require_office_network: bool
+    allowed_subnet: str
+    allowed_subnets: str
+    allow_admin_from_anywhere: bool
+    trust_proxy: bool
+    session_cookie_secure: bool
+    enable_route_debug: bool
+    log_level: str
+
+
+def load_runtime_settings():
+    is_vercel = env_flag("VERCEL", False) or bool(os.getenv("VERCEL_ENV", "").strip())
+    app_env = os.getenv("APP_ENV", os.getenv("FLASK_ENV", "production" if is_vercel else "development")).strip().lower()
+    is_production = app_env == "production" or is_vercel
+    secret_key = os.getenv("SECRET_KEY", "").strip()
+    secret_key_configured = bool(secret_key)
+    if not secret_key:
+        secret_key = "dev-change-this-secret" if not is_production else "vercel-misconfigured-secret"
+    log_level = os.getenv("LOG_LEVEL", "INFO").strip().upper() or "INFO"
+    return RuntimeSettings(
+        app_env=app_env,
+        is_production=is_production,
+        is_vercel=is_vercel,
+        secret_key=secret_key,
+        secret_key_configured=secret_key_configured,
+        turso_database_url=os.getenv("TURSO_DATABASE_URL", "").strip(),
+        turso_auth_token=os.getenv("TURSO_AUTH_TOKEN", "").strip(),
+        require_office_network=env_flag("REQUIRE_OFFICE_NETWORK", False),
+        allowed_subnet=os.getenv("ALLOWED_SUBNET", "").strip(),
+        allowed_subnets=os.getenv("ALLOWED_SUBNETS", "").strip(),
+        allow_admin_from_anywhere=env_flag("ALLOW_ADMIN_FROM_ANYWHERE", True),
+        trust_proxy=env_flag("TRUST_PROXY", is_vercel or is_production),
+        session_cookie_secure=env_flag("SESSION_COOKIE_SECURE", is_vercel or is_production),
+        enable_route_debug=env_flag("ENABLE_ROUTE_DEBUG", True),
+        log_level=log_level,
+    )
+
+
+SETTINGS = load_runtime_settings()
+APP_ENV = SETTINGS.app_env
+IS_PRODUCTION = SETTINGS.is_production
+IS_VERCEL = SETTINGS.is_vercel
+SECRET_KEY = SETTINGS.secret_key
+SECRET_KEY_CONFIGURED = SETTINGS.secret_key_configured
+TURSO_DATABASE_URL = SETTINGS.turso_database_url
+TURSO_AUTH_TOKEN = SETTINGS.turso_auth_token
+REQUIRE_OFFICE_NETWORK = SETTINGS.require_office_network
+ALLOWED_SUBNET = SETTINGS.allowed_subnet
+ALLOWED_SUBNETS = SETTINGS.allowed_subnets
+ALLOW_ADMIN_FROM_ANYWHERE = SETTINGS.allow_admin_from_anywhere
+TRUST_PROXY = SETTINGS.trust_proxy
+SESSION_COOKIE_SECURE = SETTINGS.session_cookie_secure
+ENABLE_ROUTE_DEBUG = SETTINGS.enable_route_debug
 HAS_EXPLICIT_ALLOWED_NETWORKS = bool(ALLOWED_SUBNET or ALLOWED_SUBNETS)
 
-
-def env_flag(name, default=False):
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+logging.basicConfig(
+    level=getattr(logging, SETTINGS.log_level, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s %(message)s",
+)
 
 
 def load_allowed_networks():
@@ -82,89 +149,286 @@ def load_allowed_networks():
 
 
 ALLOWED_NETWORKS = load_allowed_networks()
-SESSION_COOKIE_SECURE = env_flag("SESSION_COOKIE_SECURE", IS_PRODUCTION)
-
-app = Flask(__name__)
+app = Flask(__name__, static_folder=str(STATIC_DIR), template_folder=str(TEMPLATE_DIR))
 app.config.update(
     SECRET_KEY=SECRET_KEY,
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=SESSION_COOKIE_SECURE,
+    JSON_SORT_KEYS=False,
+    PROPAGATE_EXCEPTIONS=False,
 )
+app.logger.setLevel(getattr(logging, SETTINGS.log_level, logging.INFO))
 if TRUST_PROXY:
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1)
 CORS(app, supports_credentials=True)
 
 
-def conn_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+class AppConfigError(RuntimeError):
+    pass
 
 
-def restore_db_from_github():
+class DatabaseConnectionError(RuntimeError):
+    pass
+
+
+def missing_required_env_vars():
+    missing = []
+    if not SECRET_KEY_CONFIGURED:
+        missing.append("SECRET_KEY")
+    if not TURSO_DATABASE_URL:
+        missing.append("TURSO_DATABASE_URL")
+    if not TURSO_AUTH_TOKEN:
+        missing.append("TURSO_AUTH_TOKEN")
+    return missing
+
+
+def log_runtime_configuration():
+    missing = missing_required_env_vars()
+    if missing:
+        app.logger.error("Missing required environment variables: %s", ", ".join(missing))
+    if not SECRET_KEY_CONFIGURED:
+        app.logger.warning("SECRET_KEY is not configured. Using a fallback key; configure SECRET_KEY for reliable secure sessions.")
+    app.logger.info(
+        "Runtime configuration loaded: env=%s vercel=%s trust_proxy=%s office_restriction=%s public_dir=%s public_exists=%s templates_exists=%s static_exists=%s route_debug=%s",
+        APP_ENV,
+        IS_VERCEL,
+        TRUST_PROXY,
+        REQUIRE_OFFICE_NETWORK,
+        PUBLIC_DIR,
+        PUBLIC_DIR.is_dir(),
+        TEMPLATE_DIR.is_dir(),
+        STATIC_DIR.is_dir(),
+        ENABLE_ROUTE_DEBUG,
+    )
+
+
+def ensure_database_configuration():
+    missing = []
+    if not TURSO_DATABASE_URL:
+        missing.append("TURSO_DATABASE_URL")
+    if not TURSO_AUTH_TOKEN:
+        missing.append("TURSO_AUTH_TOKEN")
+    if missing:
+        raise AppConfigError(f"Missing required environment variables: {', '.join(missing)}")
+    scheme = urlparse(TURSO_DATABASE_URL).scheme.lower()
+    if scheme not in {"libsql", "https", "http", "wss", "ws"}:
+        raise AppConfigError("TURSO_DATABASE_URL must be a remote Turso/libSQL URL using libsql, https, http, wss, or ws")
+
+
+def public_file_path(filename):
+    return PUBLIC_DIR / filename
+
+
+class DBRow(dict):
+    def __init__(self, columns, values):
+        super().__init__(zip(columns, values))
+        self._columns = tuple(columns)
+        self._values = tuple(values)
+
+    def __getitem__(self, key):
+        if isinstance(key, int):
+            return self._values[key]
+        return super().__getitem__(key)
+
+
+def wrap_db_row(description, row):
+    if row is None:
+        return None
+    if isinstance(row, DBRow):
+        return row
+    if isinstance(row, dict):
+        return DBRow(tuple(row.keys()), tuple(row.values()))
+    if not description:
+        return row
+    columns = [col[0] if isinstance(col, (tuple, list)) else col for col in description]
+    return DBRow(columns, row)
+
+
+class DBCursor:
+    def __init__(self, result=None):
+        self._result = result
+        self._rows = list(getattr(result, "rows", []) or [])
+        self._index = 0
+
+    @property
+    def description(self):
+        columns = tuple(getattr(self._result, "columns", ()) or ())
+        return columns or None
+
+    @property
+    def lastrowid(self):
+        return getattr(self._result, "last_insert_rowid", None)
+
+    def fetchone(self):
+        if self._index >= len(self._rows):
+            return None
+        row = self._rows[self._index]
+        self._index += 1
+        return wrap_db_row(self.description, row)
+
+    def fetchall(self):
+        if self._index >= len(self._rows):
+            return []
+        rows = self._rows[self._index:]
+        self._index = len(self._rows)
+        return [wrap_db_row(self.description, row) for row in rows]
+
+    def execute(self, sql, params=()):
+        raise DatabaseConnectionError("Use the connection object to execute Turso queries")
+
+    def executemany(self, sql, seq_of_parameters):
+        raise DatabaseConnectionError("Use the connection object to execute Turso queries")
+
+    def __iter__(self):
+        return iter(self.fetchall())
+
+
+class DBConnection:
+    def __init__(self, client):
+        self._client = client
+
+    def execute(self, sql, params=()):
+        return DBCursor(self._client.execute(sql, params or ()))
+
+    def executemany(self, sql, seq_of_parameters):
+        result = None
+        for params in seq_of_parameters:
+            result = self._client.execute(sql, params or ())
+        return DBCursor(result)
+
+    def executescript(self, sql_script):
+        statements = [statement.strip() for statement in sql_script.split(";") if statement.strip()]
+        result = None
+        for statement in statements:
+            result = self._client.execute(statement)
+        return DBCursor(result)
+
+    def cursor(self):
+        return self
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return self._client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+    def __getattr__(self, name):
+        return getattr(self._client, name)
+
+
+def libsql_client_version():
     try:
-        if DB_PATH.exists():
-            return
-
-        repo = os.getenv("GITHUB_REPO", "").strip()
-        if not repo:
-            return
-
-        raw_url = f"https://raw.githubusercontent.com/{repo}/main/db_backup/database.db"
-        response = requests.get(raw_url, timeout=20)
-        if response.status_code == 200 and response.content:
-            DB_PATH.write_bytes(response.content)
-    except Exception:
-        pass
+        return importlib.metadata.version("libsql-client")
+    except importlib.metadata.PackageNotFoundError:
+        return "unknown"
 
 
-def backup_db_to_github():
-    if not DB_PATH.exists():
-        return
+def turso_url_scheme(url=None):
+    return urlparse(url or TURSO_DATABASE_URL).scheme.lower()
 
-    token = os.getenv("GITHUB_TOKEN", "").strip()
-    repo = os.getenv("GITHUB_REPO", "").strip()
-    if not token or not repo:
-        return
 
+def turso_client_url():
+    parsed = urlparse(TURSO_DATABASE_URL)
+    if parsed.scheme.lower() == "libsql":
+        return parsed._replace(scheme="https").geturl()
+    return TURSO_DATABASE_URL
+
+
+def open_db_connection():
+    ensure_database_configuration()
+    client_url = turso_client_url()
     try:
-        encoded_db = base64.b64encode(DB_PATH.read_bytes()).decode("utf-8")
-    except Exception:
-        return
+        return DBConnection(libsql_client.create_client_sync(url=client_url, auth_token=TURSO_AUTH_TOKEN))
+    except Exception as exc:
+        app.logger.exception("Failed to open Turso connection")
+        raise DatabaseConnectionError("Unable to connect to Turso database") from exc
 
-    contents_url = f"https://api.github.com/repos/{repo}/contents/db_backup/database.db"
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github+json",
-    }
 
-    sha = None
-    try:
-        metadata_response = requests.get(contents_url, headers=headers, timeout=20)
-    except Exception:
-        return
+class DBContext:
+    def __init__(self, initialize=True, prefer_request=True):
+        self.initialize = initialize
+        self.prefer_request = prefer_request
+        self.conn = None
+        self.request_scoped = False
 
-    if metadata_response.status_code == 200:
+    def __enter__(self):
+        if self.initialize:
+            ensure_db_ready()
+        if self.prefer_request and has_request_context():
+            conn = getattr(g, "_db_conn", None)
+            if conn is None:
+                conn = open_db_connection()
+                g._db_conn = conn
+            self.conn = conn
+            self.request_scoped = True
+            return conn
+        self.conn = open_db_connection()
+        return self.conn
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.conn is None:
+            return False
+        if exc_type is not None:
+            try:
+                self.conn.rollback()
+            except Exception:
+                app.logger.warning("Rollback failed while handling exception", exc_info=True)
+        else:
+            try:
+                self.conn.commit()
+            except Exception:
+                app.logger.exception("Failed to commit Turso transaction")
+                raise
+        if self.request_scoped:
+            return False
         try:
-            sha = (metadata_response.json() or {}).get("sha")
+            self.conn.close()
         except Exception:
-            return
-    elif metadata_response.status_code != 404:
+            app.logger.warning("Failed to close standalone Turso connection", exc_info=True)
+        return False
+
+
+def conn_db(initialize=True, prefer_request=True):
+    return DBContext(initialize=initialize, prefer_request=prefer_request)
+
+
+@app.teardown_appcontext
+def close_request_db(exc):
+    conn = g.pop("_db_conn", None)
+    if conn is None:
         return
-
-    payload = {
-        "message": "Auto backup database",
-        "content": encoded_db,
-    }
-    if sha:
-        payload["sha"] = sha
-
+    if exc is not None:
+        try:
+            conn.rollback()
+        except Exception:
+            app.logger.warning("Rollback failed during request teardown", exc_info=True)
     try:
-        requests.put(contents_url, headers=headers, json=payload, timeout=30)
+        conn.close()
     except Exception:
-        return
+        app.logger.warning("Failed to close request-scoped Turso connection", exc_info=True)
+
+
+def is_constraint_error(exc):
+    message = str(exc or "").upper()
+    markers = (
+        "CONSTRAINT FAILED",
+        "UNIQUE CONSTRAINT FAILED",
+        "NOT NULL CONSTRAINT FAILED",
+        "FOREIGN KEY CONSTRAINT FAILED",
+        "CHECK CONSTRAINT FAILED",
+    )
+    return any(marker in message for marker in markers)
 
 
 def has_col(conn, table, col):
@@ -227,8 +491,15 @@ def parse_dt(v):
 
 
 def get_client_ip():
-    f = request.headers.get("X-Forwarded-For", "")
-    return f.split(",")[0].strip() if f else (request.remote_addr or "")
+    forwarded_for = request.headers.get("X-Forwarded-For", "")
+    if forwarded_for:
+        return forwarded_for.split(",")[0].strip()
+    if request.access_route:
+        return request.access_route[0]
+    real_ip = request.headers.get("X-Real-IP", "").strip()
+    if real_ip:
+        return real_ip
+    return request.remote_addr or ""
 
 
 def office_ok():
@@ -251,11 +522,79 @@ def office_ok():
 def office_check():
     if office_ok():
         return None
-    return jsonify({"message": "Access allowed only from office network"}), 403
+    return error_response("Access allowed only from office network", 403)
 
 
 def role_bypasses_office_check(role):
     return ALLOW_ADMIN_FROM_ANYWHERE and role == "ADMIN"
+
+
+def scanner_access_check():
+    if office_ok():
+        return None
+    user = auth_user()
+    if user and role_bypasses_office_check(user["role"]):
+        return None
+    return error_response("Access allowed only from office network", 403)
+
+
+def route_manifest():
+    routes = []
+    for rule in sorted(app.url_map.iter_rules(), key=lambda item: item.rule):
+        routes.append(
+            {
+                "rule": rule.rule,
+                "endpoint": rule.endpoint,
+                "methods": sorted(m for m in rule.methods if m not in {"HEAD", "OPTIONS"}),
+            }
+        )
+    return routes
+
+
+def wants_json_response():
+    path = request.path or ""
+    if request.is_json:
+        return True
+    if path.startswith("/api/") or path.startswith("/auth/") or path in {"/health", "/routes", "/scan", "/generate-qr"}:
+        return True
+    accept = request.accept_mimetypes
+    return accept.accept_json and (not accept.accept_html or accept["application/json"] >= accept["text/html"])
+
+
+def error_response(message, status_code, *, details=None):
+    payload = {"message": message, "status": status_code}
+    if details is not None:
+        payload["details"] = details
+    if wants_json_response():
+        return jsonify(payload), status_code
+    return f"{message}\n", status_code, {"Content-Type": "text/plain; charset=utf-8"}
+
+
+@app.errorhandler(AppConfigError)
+def handle_app_config_error(exc):
+    app.logger.exception("Application configuration error for %s %s: %s", request.method, request.path, exc)
+    return error_response("Application configuration error", 503, details=str(exc))
+
+
+@app.errorhandler(DatabaseConnectionError)
+def handle_database_connection_error(exc):
+    app.logger.exception("Database connection error for %s %s: %s", request.method, request.path, exc)
+    return error_response("Database connection error", 503, details=str(exc))
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(exc):
+    if exc.code and exc.code >= 500:
+        app.logger.exception("HTTP exception during %s %s", request.method, request.path)
+    else:
+        app.logger.warning("HTTP exception during %s %s: %s", request.method, request.path, exc)
+    return error_response(exc.description or exc.name, exc.code or 500)
+
+
+@app.errorhandler(Exception)
+def handle_unexpected_exception(exc):
+    app.logger.exception("Unhandled exception during %s %s", request.method, request.path)
+    return error_response("Internal server error", 500, details=str(exc) if not IS_PRODUCTION else None)
 
 
 def valid_pin(pin):
@@ -282,6 +621,33 @@ def to_items(rows):
     return [dict(r) for r in rows]
 
 
+def parse_admin_user_payload(payload):
+    d = payload or {}
+    name = str(d.get("name", "")).strip()
+    role = str(d.get("role", "EMPLOYEE")).strip().upper()
+    code = str(d.get("employee_code", "")).strip()
+    pin = str(d.get("pin", "")).strip()
+    if not name or role not in {"ADMIN", "EMPLOYEE"} or not code or not valid_pin(pin):
+        return None
+    try:
+        category_id = int(d.get("category_id", 1))
+        shift_id = int(d.get("shift_id", 1))
+        active = int(d.get("active", 1))
+    except Exception:
+        return None
+    if active not in {0, 1}:
+        return None
+    return {
+        "name": name,
+        "role": role,
+        "employee_code": code,
+        "pin": pin,
+        "category_id": category_id,
+        "shift_id": shift_id,
+        "active": active,
+    }
+
+
 def user_profile(conn, user_id):
     return conn.execute(
         """
@@ -298,24 +664,72 @@ def user_profile(conn, user_id):
     ).fetchone()
 
 
+def round_overtime_hours(value):
+    value = max(0.0, float(value or 0.0))
+    return math.floor(value * 2) / 2
+
+
 def calc_metrics(login_iso, logout_iso, profile):
     login = parse_dt(login_iso).astimezone(IST)
     logout = parse_dt(logout_iso).astimezone(IST)
     total_hours = max(0, (logout - login).total_seconds() / 3600)
-    required = float(profile["required_hours"] or 9)
-    ot = max(0, total_hours - required)
     st = datetime.combine(login.date(), time.fromisoformat(profile["shift_start"]), tzinfo=IST)
-    et = datetime.combine(login.date(), time.fromisoformat(profile["shift_end"]), tzinfo=IST)
-    if et <= st:
-        et += timedelta(days=1)
+    required_hours_value = 9.0
+    if isinstance(profile, dict):
+        required_hours_value = float(profile.get("required_hours", 9) or 0) or 9.0
+    elif hasattr(profile, "keys") and "required_hours" in profile.keys():
+        required_hours_value = float(profile["required_hours"] or 0) or 9.0
+    assigned_shift_hours = max(0, required_hours_value)
+    ot = max(0, total_hours - assigned_shift_hours)
     late = int(login > st + timedelta(minutes=int(profile["grace_minutes"] or 0)))
     status = "PRESENT"
     return {
         "total_hours": round(total_hours, 4),
-        "overtime": round(ot, 4),
+        "overtime": round_overtime_hours(ot),
         "late_mark": late,
         "status": status,
     }
+
+
+def snapshot_schedule_fields(profile):
+    return {
+        "scheduled_shift_start": str(profile["shift_start"]),
+        "scheduled_shift_end": str(profile["shift_end"]),
+        "scheduled_grace_minutes": int(profile["grace_minutes"] or 0),
+    }
+
+
+def profile_for_attendance(conn, user_id, attendance_row=None):
+    required_hours = 9.0
+    p = user_profile(conn, user_id)
+    if p:
+        required_hours = float(p["required_hours"] or 0) or 9.0
+
+    if attendance_row:
+        sst = attendance_row["scheduled_shift_start"] if "scheduled_shift_start" in attendance_row.keys() else None
+        set_ = attendance_row["scheduled_shift_end"] if "scheduled_shift_end" in attendance_row.keys() else None
+        sgm = attendance_row["scheduled_grace_minutes"] if "scheduled_grace_minutes" in attendance_row.keys() else None
+        if sst and set_ and sgm is not None:
+            return {
+                "shift_start": sst,
+                "shift_end": set_,
+                "grace_minutes": int(sgm),
+                "required_hours": required_hours,
+            }
+    if not p:
+        return {"shift_start": "09:00", "shift_end": "18:00", "grace_minutes": 15, "required_hours": required_hours}
+    return {
+        "shift_start": p["shift_start"],
+        "shift_end": p["shift_end"],
+        "grace_minutes": int(p["grace_minutes"] or 0),
+        "required_hours": required_hours,
+    }
+
+
+def late_mark_for_login(login_iso, profile):
+    login = parse_dt(login_iso).astimezone(IST)
+    st = datetime.combine(login.date(), time.fromisoformat(profile["shift_start"]), tzinfo=IST)
+    return int(login > st + timedelta(minutes=int(profile["grace_minutes"] or 0)))
 
 
 def execute_attendance_session_action(conn, user_id, purpose, action_iso, login_method=None):
@@ -324,6 +738,9 @@ def execute_attendance_session_action(conn, user_id, purpose, action_iso, login_
         method = str(login_method or "UNKNOWN").strip().upper()
         if method not in {"QR", "OTP"}:
             method = "UNKNOWN"
+        profile = profile_for_attendance(conn, user_id)
+        schedule = snapshot_schedule_fields(profile)
+        late_mark = late_mark_for_login(action_iso, profile)
         open_row = conn.execute("SELECT id FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
         if open_row:
             return {"message": "User already logged in"}, 400
@@ -333,16 +750,33 @@ def execute_attendance_session_action(conn, user_id, purpose, action_iso, login_
             return {"message": "Attendance already captured for today"}, 400
 
         if today and not today["login_time"]:
-            conn.execute("UPDATE attendance SET login_time=?,login_method=?,status='PRESENT',system_logout=0,updated_at=? WHERE id=?", (action_iso, method, action_iso, today["id"]))
+            conn.execute(
+                """
+                UPDATE attendance
+                SET login_time=?,login_method=?,total_hours=NULL,overtime=NULL,late_mark=?,status='PRESENT',system_logout=0,
+                    scheduled_shift_start=?,scheduled_shift_end=?,scheduled_grace_minutes=?,updated_at=?
+                WHERE id=?
+                """,
+                (action_iso, method, late_mark, schedule["scheduled_shift_start"], schedule["scheduled_shift_end"], schedule["scheduled_grace_minutes"], action_iso, today["id"]),
+            )
         else:
-            conn.execute("INSERT INTO attendance (user_id,attendance_date,login_time,login_method,break_taken,status,created_at,updated_at) VALUES (?,?,?,?,1,'PRESENT',?,?)", (user_id, day, action_iso, method, action_iso, action_iso))
+            conn.execute(
+                """
+                INSERT INTO attendance (
+                    user_id,attendance_date,login_time,login_method,late_mark,break_taken,status,
+                    scheduled_shift_start,scheduled_shift_end,scheduled_grace_minutes,created_at,updated_at
+                )
+                VALUES (?,?,?,?,?,1,'PRESENT',?,?,?,?,?)
+                """,
+                (user_id, day, action_iso, method, late_mark, schedule["scheduled_shift_start"], schedule["scheduled_shift_end"], schedule["scheduled_grace_minutes"], action_iso, action_iso),
+            )
         return {"message": "Login Recorded"}, 200
 
     if purpose == "logout":
         rec = conn.execute("SELECT * FROM attendance WHERE user_id=? AND login_time IS NOT NULL AND logout_time IS NULL ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
         if not rec:
             return {"message": "No login found"}, 400
-        profile = user_profile(conn, user_id)
+        profile = profile_for_attendance(conn, user_id, rec)
         m = calc_metrics(rec["login_time"], action_iso, profile)
         conn.execute("UPDATE attendance SET logout_time=?,total_hours=?,overtime=?,late_mark=?,status=?,updated_at=? WHERE id=?", (action_iso, m["total_hours"], m["overtime"], m["late_mark"], m["status"], action_iso, rec["id"]))
         return {"message": "Logout Recorded", "metrics": m}, 200
@@ -410,6 +844,9 @@ def rebuild_schema_if_needed(conn):
                 overtime REAL,
                 late_mark INTEGER NOT NULL DEFAULT 0,
                 break_taken INTEGER NOT NULL DEFAULT 1,
+                scheduled_shift_start TEXT,
+                scheduled_shift_end TEXT,
+                scheduled_grace_minutes INTEGER,
                 status TEXT NOT NULL DEFAULT 'PRESENT',
                 system_logout INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
@@ -421,7 +858,7 @@ def rebuild_schema_if_needed(conn):
         conn.execute(
             """
             INSERT INTO attendance (
-                id,user_id,attendance_date,login_time,login_method,logout_time,total_hours,overtime,late_mark,break_taken,status,system_logout,created_at,updated_at
+                id,user_id,attendance_date,login_time,login_method,logout_time,total_hours,overtime,late_mark,break_taken,scheduled_shift_start,scheduled_shift_end,scheduled_grace_minutes,status,system_logout,created_at,updated_at
             )
             WITH normalized AS (
                 SELECT *,
@@ -437,6 +874,7 @@ def rebuild_schema_if_needed(conn):
                 id,user_id,normalized_date,login_time,NULL,logout_time,total_hours,overtime,
                 COALESCE(late_mark,0),
                 COALESCE(break_taken,1),
+                NULL,NULL,NULL,
                 CASE WHEN status='ABSENT' THEN 'ABSENT' ELSE 'PRESENT' END,
                 COALESCE(system_logout,0),
                 COALESCE(created_at,login_time,?),
@@ -469,6 +907,9 @@ def rebuild_schema_if_needed(conn):
                     overtime REAL,
                     late_mark INTEGER NOT NULL DEFAULT 0,
                     break_taken INTEGER NOT NULL DEFAULT 1,
+                    scheduled_shift_start TEXT,
+                    scheduled_shift_end TEXT,
+                    scheduled_grace_minutes INTEGER,
                     status TEXT NOT NULL DEFAULT 'PRESENT',
                     system_logout INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
@@ -480,7 +921,7 @@ def rebuild_schema_if_needed(conn):
             conn.execute(
                 """
                 INSERT INTO attendance (
-                    id,user_id,attendance_date,login_time,login_method,logout_time,total_hours,overtime,late_mark,break_taken,status,system_logout,created_at,updated_at
+                    id,user_id,attendance_date,login_time,login_method,logout_time,total_hours,overtime,late_mark,break_taken,scheduled_shift_start,scheduled_shift_end,scheduled_grace_minutes,status,system_logout,created_at,updated_at
                 )
                 WITH normalized AS (
                     SELECT *,
@@ -496,6 +937,7 @@ def rebuild_schema_if_needed(conn):
                     id,user_id,normalized_date,login_time,NULL,logout_time,total_hours,overtime,
                     COALESCE(late_mark,0),
                     COALESCE(break_taken,1),
+                    NULL,NULL,NULL,
                     CASE WHEN status='ABSENT' THEN 'ABSENT' ELSE 'PRESENT' END,
                     COALESCE(system_logout,0),
                     COALESCE(created_at,login_time,?),
@@ -512,58 +954,98 @@ def rebuild_schema_if_needed(conn):
     conn.execute("DROP INDEX IF EXISTS idx_edit_req_status_created")
 
 
-def init_db():
-    with conn_db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS employee_categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,required_hours REAL NOT NULL);
-            CREATE TABLE IF NOT EXISTS shifts(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,grace_minutes INTEGER NOT NULL DEFAULT 15);
-            CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT,role TEXT NOT NULL DEFAULT 'EMPLOYEE',employee_code TEXT,pin_hash TEXT,category_id INTEGER,shift_id INTEGER,category_hours INTEGER,active INTEGER NOT NULL DEFAULT 1,created_at TEXT);
-            CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,attendance_date TEXT NOT NULL,login_time TEXT,login_method TEXT,logout_time TEXT,total_hours REAL,overtime REAL,late_mark INTEGER NOT NULL DEFAULT 0,break_taken INTEGER NOT NULL DEFAULT 1,status TEXT NOT NULL DEFAULT 'PRESENT',system_logout INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT,UNIQUE(user_id,attendance_date));
-            CREATE TABLE IF NOT EXISTS qr_sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,purpose TEXT NOT NULL,expires_at INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,otp_hash TEXT,otp_failed_attempts INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id,attendance_date);
-            CREATE INDEX IF NOT EXISTS idx_attendance_status_date ON attendance(status,attendance_date);
-            CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at);
-            """
-        )
-        rebuild_schema_if_needed(conn)
-        ensure_col(conn, "users", "role", "TEXT NOT NULL DEFAULT 'EMPLOYEE'")
-        ensure_col(conn, "users", "employee_code", "TEXT")
-        ensure_col(conn, "users", "pin_hash", "TEXT")
-        ensure_col(conn, "users", "pin_plain", "TEXT")
-        ensure_col(conn, "users", "category_id", "INTEGER")
-        ensure_col(conn, "users", "shift_id", "INTEGER")
-        ensure_col(conn, "users", "active", "INTEGER NOT NULL DEFAULT 1")
-        ensure_col(conn, "users", "created_at", "TEXT")
-        ensure_col(conn, "attendance", "attendance_date", "TEXT")
-        ensure_col(conn, "attendance", "login_method", "TEXT")
-        ensure_col(conn, "attendance", "late_mark", "INTEGER NOT NULL DEFAULT 0")
-        ensure_col(conn, "attendance", "break_taken", "INTEGER NOT NULL DEFAULT 1")
-        ensure_col(conn, "attendance", "status", "TEXT NOT NULL DEFAULT 'PRESENT'")
-        ensure_col(conn, "attendance", "system_logout", "INTEGER NOT NULL DEFAULT 0")
-        ensure_col(conn, "attendance", "created_at", "TEXT")
-        ensure_col(conn, "attendance", "updated_at", "TEXT")
-        ensure_col(conn, "qr_sessions", "created_at", "TEXT")
-        ensure_col(conn, "qr_sessions", "otp_hash", "TEXT")
-        ensure_col(conn, "qr_sessions", "otp_failed_attempts", "INTEGER NOT NULL DEFAULT 0")
-        conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at)")
-        conn.execute("INSERT OR IGNORE INTO employee_categories (id,name,required_hours) VALUES (1,'General',9)")
-        conn.execute("INSERT OR IGNORE INTO shifts (id,name,start_time,end_time,grace_minutes) VALUES (1,'General Shift','09:00','18:00',15)")
-        conn.execute("INSERT OR IGNORE INTO users (id,name,role,employee_code,category_id,shift_id,category_hours,active,created_at) VALUES (1,'Employee1','EMPLOYEE','EMP001',1,1,9,1,?)", (now_iso(),))
-        conn.execute("INSERT OR IGNORE INTO users (id,name,role,employee_code,category_id,shift_id,category_hours,active,created_at) VALUES (999,'Admin','ADMIN','ADMIN001',1,1,9,1,?)", (now_iso(),))
-        users = conn.execute("SELECT id,role,pin_hash,employee_code FROM users").fetchall()
-        for u in users:
-            if not u["pin_hash"]:
-                pin = DEFAULT_ADMIN_PIN if u["role"] == "ADMIN" else DEFAULT_EMPLOYEE_PIN
-                conn.execute("UPDATE users SET pin_hash=?,pin_plain=? WHERE id=?", (generate_password_hash(pin), pin, u["id"]))
-            if not u["employee_code"]:
-                prefix = "ADMIN" if u["role"] == "ADMIN" else "EMP"
-                conn.execute("UPDATE users SET employee_code=? WHERE id=?", (f"{prefix}{int(u['id']):03d}", u["id"]))
-        conn.execute("UPDATE attendance SET attendance_date=COALESCE(attendance_date,substr(login_time,1,10),substr(created_at,1,10),?) WHERE attendance_date IS NULL", (now_ist().date().isoformat(),))
-        conn.execute("UPDATE attendance SET created_at=COALESCE(created_at,login_time,?),updated_at=COALESCE(updated_at,logout_time,login_time,?) WHERE created_at IS NULL OR updated_at IS NULL", (now_iso(), now_iso()))
-        conn.execute("UPDATE qr_sessions SET created_at=COALESCE(created_at,?) WHERE created_at IS NULL", (now_iso(),))
-        conn.execute("UPDATE qr_sessions SET otp_failed_attempts=COALESCE(otp_failed_attempts,0) WHERE otp_failed_attempts IS NULL")
+def initialize_database_schema(conn):
+    bootstrap_statements = (
+        "CREATE TABLE IF NOT EXISTS employee_categories(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,required_hours REAL NOT NULL)",
+        "CREATE TABLE IF NOT EXISTS shifts(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT UNIQUE NOT NULL,start_time TEXT NOT NULL,end_time TEXT NOT NULL,grace_minutes INTEGER NOT NULL DEFAULT 15)",
+        "CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY,name TEXT,role TEXT NOT NULL DEFAULT 'EMPLOYEE',employee_code TEXT,pin_hash TEXT,category_id INTEGER,shift_id INTEGER,category_hours INTEGER,active INTEGER NOT NULL DEFAULT 1,created_at TEXT)",
+        "CREATE TABLE IF NOT EXISTS attendance(id INTEGER PRIMARY KEY AUTOINCREMENT,user_id INTEGER NOT NULL,attendance_date TEXT NOT NULL,login_time TEXT,login_method TEXT,logout_time TEXT,total_hours REAL,overtime REAL,late_mark INTEGER NOT NULL DEFAULT 0,break_taken INTEGER NOT NULL DEFAULT 1,scheduled_shift_start TEXT,scheduled_shift_end TEXT,scheduled_grace_minutes INTEGER,status TEXT NOT NULL DEFAULT 'PRESENT',system_logout INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,updated_at TEXT,UNIQUE(user_id,attendance_date))",
+        "CREATE TABLE IF NOT EXISTS qr_sessions(id TEXT PRIMARY KEY,user_id INTEGER NOT NULL,purpose TEXT NOT NULL,expires_at INTEGER NOT NULL,used INTEGER NOT NULL DEFAULT 0,otp_hash TEXT,otp_failed_attempts INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL)",
+        "CREATE INDEX IF NOT EXISTS idx_attendance_user_date ON attendance(user_id,attendance_date)",
+        "CREATE INDEX IF NOT EXISTS idx_attendance_status_date ON attendance(status,attendance_date)",
+        "CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at)",
+    )
+    for statement in bootstrap_statements:
+        conn.execute(statement)
+    rebuild_schema_if_needed(conn)
+    ensure_col(conn, "users", "role", "TEXT NOT NULL DEFAULT 'EMPLOYEE'")
+    ensure_col(conn, "users", "employee_code", "TEXT")
+    ensure_col(conn, "users", "pin_hash", "TEXT")
+    ensure_col(conn, "users", "pin_plain", "TEXT")
+    ensure_col(conn, "users", "category_id", "INTEGER")
+    ensure_col(conn, "users", "shift_id", "INTEGER")
+    ensure_col(conn, "users", "active", "INTEGER NOT NULL DEFAULT 1")
+    ensure_col(conn, "users", "created_at", "TEXT")
+    ensure_col(conn, "attendance", "attendance_date", "TEXT")
+    ensure_col(conn, "attendance", "login_method", "TEXT")
+    ensure_col(conn, "attendance", "late_mark", "INTEGER NOT NULL DEFAULT 0")
+    ensure_col(conn, "attendance", "break_taken", "INTEGER NOT NULL DEFAULT 1")
+    ensure_col(conn, "attendance", "scheduled_shift_start", "TEXT")
+    ensure_col(conn, "attendance", "scheduled_shift_end", "TEXT")
+    ensure_col(conn, "attendance", "scheduled_grace_minutes", "INTEGER")
+    ensure_col(conn, "attendance", "status", "TEXT NOT NULL DEFAULT 'PRESENT'")
+    ensure_col(conn, "attendance", "system_logout", "INTEGER NOT NULL DEFAULT 0")
+    ensure_col(conn, "attendance", "created_at", "TEXT")
+    ensure_col(conn, "attendance", "updated_at", "TEXT")
+    ensure_col(conn, "qr_sessions", "created_at", "TEXT")
+    ensure_col(conn, "qr_sessions", "otp_hash", "TEXT")
+    ensure_col(conn, "qr_sessions", "otp_failed_attempts", "INTEGER NOT NULL DEFAULT 0")
+    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_employee_code ON users(employee_code)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qr_sessions_user_active ON qr_sessions(user_id,used,expires_at,created_at)")
+    conn.execute("INSERT OR IGNORE INTO employee_categories (id,name,required_hours) VALUES (1,'General',9)")
+    conn.execute("INSERT OR IGNORE INTO shifts (id,name,start_time,end_time,grace_minutes) VALUES (1,'General Shift','09:00','18:00',15)")
+    conn.execute("INSERT OR IGNORE INTO users (id,name,role,employee_code,category_id,shift_id,category_hours,active,created_at) VALUES (1,'Employee1','EMPLOYEE','EMP001',1,1,9,1,?)", (now_iso(),))
+    conn.execute("INSERT OR IGNORE INTO users (id,name,role,employee_code,category_id,shift_id,category_hours,active,created_at) VALUES (999,'Admin','ADMIN','ADMIN001',1,1,9,1,?)", (now_iso(),))
+    users = conn.execute("SELECT id,role,pin_hash,employee_code FROM users").fetchall()
+    for u in users:
+        if not u["pin_hash"]:
+            pin = DEFAULT_ADMIN_PIN if u["role"] == "ADMIN" else DEFAULT_EMPLOYEE_PIN
+            conn.execute("UPDATE users SET pin_hash=?,pin_plain=? WHERE id=?", (generate_password_hash(pin), pin, u["id"]))
+        if not u["employee_code"]:
+            prefix = "ADMIN" if u["role"] == "ADMIN" else "EMP"
+            conn.execute("UPDATE users SET employee_code=? WHERE id=?", (f"{prefix}{int(u['id']):03d}", u["id"]))
+    conn.execute("UPDATE attendance SET attendance_date=COALESCE(attendance_date,substr(login_time,1,10),substr(created_at,1,10),?) WHERE attendance_date IS NULL", (now_ist().date().isoformat(),))
+    conn.execute("UPDATE attendance SET created_at=COALESCE(created_at,login_time,?),updated_at=COALESCE(updated_at,logout_time,login_time,?) WHERE created_at IS NULL OR updated_at IS NULL", (now_iso(), now_iso()))
+    conn.execute(
+        """
+        UPDATE attendance
+        SET scheduled_shift_start=COALESCE(scheduled_shift_start, (
+                SELECT COALESCE(s.start_time,'09:00')
+                FROM users u
+                LEFT JOIN shifts s ON s.id=u.shift_id
+                WHERE u.id=attendance.user_id
+            )),
+            scheduled_shift_end=COALESCE(scheduled_shift_end, (
+                SELECT COALESCE(s.end_time,'18:00')
+                FROM users u
+                LEFT JOIN shifts s ON s.id=u.shift_id
+                WHERE u.id=attendance.user_id
+            )),
+            scheduled_grace_minutes=COALESCE(scheduled_grace_minutes, (
+                SELECT COALESCE(s.grace_minutes,15)
+                FROM users u
+                LEFT JOIN shifts s ON s.id=u.shift_id
+                WHERE u.id=attendance.user_id
+            ))
+        WHERE scheduled_shift_start IS NULL OR scheduled_shift_end IS NULL OR scheduled_grace_minutes IS NULL
+        """
+    )
+    conn.execute("UPDATE qr_sessions SET created_at=COALESCE(created_at,?) WHERE created_at IS NULL", (now_iso(),))
+    conn.execute("UPDATE qr_sessions SET otp_failed_attempts=COALESCE(otp_failed_attempts,0) WHERE otp_failed_attempts IS NULL")
+
+
+def ensure_db_ready():
+    global DB_SCHEMA_READY
+    if DB_SCHEMA_READY:
+        return
+    with DB_READY_LOCK:
+        if DB_SCHEMA_READY:
+            return
+        with conn_db(initialize=False, prefer_request=False) as conn:
+            initialize_database_schema(conn)
+            conn.commit()
+        DB_SCHEMA_READY = True
+        app.logger.info("Database schema check completed successfully")
 
 
 def auth_user():
@@ -618,6 +1100,32 @@ def api_guard(role=None):
     return d
 
 
+def turso_health_status():
+    status = {"configured": bool(TURSO_DATABASE_URL and TURSO_AUTH_TOKEN), "reachable": False, "error": None}
+    if not status["configured"]:
+        status["error"] = "Missing TURSO_DATABASE_URL or TURSO_AUTH_TOKEN"
+        return status
+    try:
+        with conn_db(initialize=False, prefer_request=False) as conn:
+            row = conn.execute("SELECT 1 AS ok").fetchone()
+        status["reachable"] = bool(row and int(row["ok"]) == 1)
+    except Exception as exc:
+        app.logger.exception("Health check failed while probing Turso")
+        status["error"] = str(exc)
+    return status
+
+
+def static_health_status():
+    return {
+        "public_dir_exists": PUBLIC_DIR.is_dir(),
+        "templates_dir_exists": TEMPLATE_DIR.is_dir(),
+        "static_dir_exists": STATIC_DIR.is_dir(),
+        "scanner_html_exists": public_file_path("scanner.html").is_file(),
+        "scanner_js_exists": public_file_path("scanner.js").is_file(),
+        "employee_html_exists": public_file_path("employee.html").is_file(),
+    }
+
+
 @app.get("/")
 def root():
     return redirect(url_for("login_page"))
@@ -625,37 +1133,67 @@ def root():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "time_ist": now_iso()})
+    env_status = {
+        "app_env": APP_ENV,
+        "is_production": IS_PRODUCTION,
+        "is_vercel": IS_VERCEL,
+        "secret_key_configured": SECRET_KEY_CONFIGURED,
+        "turso_database_url_configured": bool(TURSO_DATABASE_URL),
+        "turso_auth_token_configured": bool(TURSO_AUTH_TOKEN),
+        "missing_required": missing_required_env_vars(),
+    }
+    db_status = turso_health_status()
+    static_status = static_health_status()
+    healthy = not env_status["missing_required"] and db_status["reachable"] and static_status["public_dir_exists"] and static_status["scanner_html_exists"] and static_status["scanner_js_exists"]
+    payload = {
+        "status": "ok" if healthy else "degraded",
+        "time_ist": now_iso(),
+        "environment": env_status,
+        "database": db_status,
+        "static": static_status,
+        "request": {
+            "client_ip": get_client_ip(),
+            "trust_proxy": TRUST_PROXY,
+            "require_office_network": REQUIRE_OFFICE_NETWORK,
+        },
+        "schema_initialized_in_process": DB_SCHEMA_READY,
+    }
+    return jsonify(payload), (200 if healthy else 503)
 
 
-@app.get("/admin.html")
-def admin_tool_page():
-    return redirect(url_for("scanner_page"))
 
 
-@app.get("/scanner")
-def scanner_page():
-    chk = office_check()
-    if chk:
-        return chk
-    return send_from_directory(PUBLIC_DIR, "scanner.html")
+
+@app.get("/scanner.html")
+def scanner_html_page():
+    return scanner_page()
+
+@app.get("/routes")
+def routes():
+    if not ENABLE_ROUTE_DEBUG:
+        return error_response("Route diagnostics are disabled", 404)
+    return jsonify(
+        {
+            "route_count": len(route_manifest()),
+            "routes": route_manifest(),
+            "time_ist": now_iso(),
+            "public_dir": str(PUBLIC_DIR),
+            "public_dir_exists": PUBLIC_DIR.is_dir(),
+        }
+    )
+
+# @app.get("/employee.html")
+# @html_guard("EMPLOYEE")
+# def employee_tool_page():
+#     return serve_public_file("employee.html")
 
 
-@app.get("/employee.html")
-@html_guard("EMPLOYEE")
-def employee_tool_page():
-    return send_from_directory(PUBLIC_DIR, "employee.html")
-
-
-@app.get("/scanner.js")
-def scanner_js():
-    return send_from_directory(PUBLIC_DIR, "scanner.js")
 
 
 @app.get("/login")
 def login_page():
     if not office_ok() and not ALLOW_ADMIN_FROM_ANYWHERE:
-        return jsonify({"message": "Access allowed only from office network"}), 403
+        return error_response("Access allowed only from office network", 403)
     if auth_user():
         return redirect(url_for("dashboard"))
     return render_template("login.html")
@@ -705,7 +1243,7 @@ def auth_login():
             return jsonify({"message": "Invalid credentials"}), 401
 
     if not office_ok() and not role_bypasses_office_check(user["role"]):
-        return jsonify({"message": "Access allowed only from office network"}), 403
+        return error_response("Access allowed only from office network", 403)
 
     session["user_id"] = int(user["id"])
     session["role"] = user["role"]
@@ -727,6 +1265,8 @@ def auth_me():
     with conn_db() as conn:
         p = user_profile(conn, int(u["id"]))
     category_name = p["category_name"] if p else "General"
+    shift_id = int(p["shift_id"]) if p and p["shift_id"] is not None else None
+    shift_name = p["shift_name"] if p else "General Shift"
     shift_start = p["shift_start"] if p else "09:00"
     shift_end = p["shift_end"] if p else "18:00"
     return jsonify(
@@ -737,6 +1277,8 @@ def auth_me():
                 "role": u["role"],
                 "employee_code": u["employee_code"],
                 "category_name": category_name,
+                "shift_id": shift_id,
+                "shift_name": shift_name,
                 "shift_start": shift_start,
                 "shift_end": shift_end,
             }
@@ -765,6 +1307,14 @@ def generate_qr():
             "INSERT INTO qr_sessions (id,user_id,purpose,expires_at,used,otp_hash,otp_failed_attempts,created_at) VALUES (?,?,?,?,0,?,?,?)",
             (token, user_id, purpose, expires, otp_digest(otp_code, token), 0, now_iso()),
         )
+        check = conn.execute(
+            "SELECT COUNT(*) FROM qr_sessions WHERE id=?",
+            (token,)
+        ).fetchone()[0]
+
+        app.logger.info(
+            "QR session created in Turso token=%s found_after_insert=%s", token, check
+        )
     payload = {"user_id": user_id, "session_token": token}
     qr_text = json.dumps(payload)
     img = qrcode.make(qr_text)
@@ -786,7 +1336,7 @@ def generate_qr():
 
 @app.post("/scan")
 def scan_qr():
-    chk = office_check()
+    chk = scanner_access_check()
     if chk:
         return chk
     data = request.get_json(silent=True) or {}
@@ -811,10 +1361,22 @@ def scan_qr():
     with conn_db() as conn:
         if qr_mode:
             qr = conn.execute("SELECT * FROM qr_sessions WHERE id=?", (token,)).fetchone()
-            if not qr or int(qr["used"]) == 1 or int(qr["expires_at"]) < nowms:
-                return jsonify({"message": "Invalid or expired credential"}), 400
+            if not qr:
+                app.logger.error(f"SCAN FAIL: token not found {token}")
+                return jsonify({"message": "QR token not found"}), 400
+
+            if int(qr["used"]) == 1:
+                app.logger.error(f"SCAN FAIL: token already used {token}")
+                return jsonify({"message": "QR already used"}), 400
+
+            if int(qr["expires_at"]) < nowms:
+                app.logger.error(
+                    f"SCAN FAIL: expired token={token} expires={qr['expires_at']} now={nowms}"
+                )
+                return jsonify({"message": "QR expired"}), 400
             conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (token,))
             payload, status = execute_attendance_session_action(conn, int(qr["user_id"]), str(qr["purpose"]).lower(), niso, "QR")
+            conn.commit()
             return jsonify(payload), status
 
         user = conn.execute("SELECT id FROM users WHERE UPPER(employee_code)=UPPER(?) AND active=1", (employee_code,)).fetchone()
@@ -835,6 +1397,7 @@ def scan_qr():
         attempts = int(qr["otp_failed_attempts"] or 0)
         if attempts >= OTP_MAX_ATTEMPTS:
             conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (qr["id"],))
+            conn.commit()
             return jsonify({"message": "OTP locked. Generate a new QR/OTP."}), 400
 
         expected = str(qr["otp_hash"])
@@ -843,6 +1406,7 @@ def scan_qr():
             new_attempts = attempts + 1
             locked = new_attempts >= OTP_MAX_ATTEMPTS
             conn.execute("UPDATE qr_sessions SET otp_failed_attempts=?,used=? WHERE id=?", (new_attempts, 1 if locked else 0, qr["id"]))
+            conn.commit()
             if locked:
                 return jsonify({"message": "OTP locked after too many failed attempts. Generate a new QR/OTP."}), 400
             remaining = OTP_MAX_ATTEMPTS - new_attempts
@@ -850,6 +1414,7 @@ def scan_qr():
 
         conn.execute("UPDATE qr_sessions SET used=1 WHERE id=?", (qr["id"],))
         payload, status = execute_attendance_session_action(conn, uid, str(qr["purpose"]).lower(), niso, "OTP")
+        conn.commit()
         return jsonify(payload), status
 
 
@@ -877,7 +1442,7 @@ def midnight_close():
                 absent += 1
                 continue
             if row["login_time"] and not row["logout_time"]:
-                p = user_profile(conn, uid)
+                p = profile_for_attendance(conn, uid, row)
                 st = datetime.combine(target, time.fromisoformat(p["shift_start"]), tzinfo=IST)
                 et = datetime.combine(target, time.fromisoformat(p["shift_end"]), tzinfo=IST)
                 if et <= st:
@@ -886,15 +1451,16 @@ def midnight_close():
                 m = calc_metrics(row["login_time"], auto_t, p)
                 conn.execute("UPDATE attendance SET logout_time=?,total_hours=?,overtime=?,late_mark=?,status=?,system_logout=1,updated_at=? WHERE id=?", (auto_t, m["total_hours"], m["overtime"], m["late_mark"], m["status"], now_iso(), row["id"]))
                 auto_logout += 1
+        conn.commit()
 
     return jsonify({"message": "Midnight close completed", "attendance_date": target.isoformat(), "absent_marked": absent, "system_logout_done": auto_logout})
 
 
 @app.get("/admin/backup-db")
-@api_guard("ADMIN")
 def backup_db():
-    backup_db_to_github()
-    return {"message": "Database backed up"}
+    return {
+        "message": "This deployment uses Turso libSQL. Use Turso branches or backups instead of the legacy local GitHub database-file backup flow."
+    }, 501
 
 
 def parse_filters():
@@ -981,6 +1547,46 @@ def admin_summary():
             (dfrom.isoformat(), dto.isoformat()),
         ).fetchone()
     return jsonify(dict(row))
+
+
+@app.get("/api/admin/employee-summary-all")
+@api_guard("ADMIN")
+def admin_employee_summary_all():
+    try:
+        dfrom, dto = resolve_date_range(request.args.get("from"), request.args.get("to"))
+    except Exception as e:
+        return jsonify({"message": str(e)}), 400
+
+    with conn_db() as conn:
+        summary = conn.execute(
+            """
+            SELECT
+            SUM(CASE WHEN status='ABSENT' THEN 1 ELSE 0 END) absent_count,
+            SUM(CASE WHEN login_time IS NOT NULL THEN 1 ELSE 0 END) total_days_worked,
+            SUM(CASE WHEN late_mark=1 THEN 1 ELSE 0 END) late_count,
+            SUM(COALESCE(total_hours,0)) total_hours,
+            SUM(COALESCE(overtime,0)) overtime_hours
+            FROM attendance WHERE attendance_date BETWEEN ? AND ?
+            """,
+            (dfrom.isoformat(), dto.isoformat()),
+        ).fetchone()
+        rows = conn.execute(
+            """
+            SELECT a.id,a.attendance_date,a.login_time,a.login_method,a.logout_time,a.total_hours,a.overtime,a.late_mark,a.break_taken,a.status,
+                   u.employee_code,
+                   CASE
+                     WHEN a.login_time IS NULL OR a.logout_time IS NULL THEN NULL
+                     ELSE ROUND(MAX(0, COALESCE(c.required_hours,9) - COALESCE(a.total_hours,0)), 4)
+                   END early_logout_hours
+            FROM attendance a
+            JOIN users u ON u.id=a.user_id
+            LEFT JOIN employee_categories c ON c.id=u.category_id
+            WHERE a.attendance_date BETWEEN ? AND ?
+            ORDER BY a.attendance_date DESC,a.id DESC
+            """,
+            (dfrom.isoformat(), dto.isoformat()),
+        ).fetchall()
+    return jsonify({"summary": dict(summary), "attendance": to_items(rows)})
 
 
 @app.get("/api/admin/employee-summary")
@@ -1198,6 +1804,15 @@ def admin_attendance_edit():
             user_params.append(user["id"])
             conn.execute(f"UPDATE users SET {', '.join(user_fields)} WHERE id=?", tuple(user_params))
 
+        current_attendance = conn.execute("SELECT * FROM attendance WHERE id=?", (row["id"],)).fetchone()
+        if has_shift or (current_attendance and (not current_attendance["scheduled_shift_start"] or not current_attendance["scheduled_shift_end"] or current_attendance["scheduled_grace_minutes"] is None)):
+            schedule_profile = profile_for_attendance(conn, int(user["id"]))
+            schedule = snapshot_schedule_fields(schedule_profile)
+            conn.execute(
+                "UPDATE attendance SET scheduled_shift_start=?,scheduled_shift_end=?,scheduled_grace_minutes=?,updated_at=? WHERE id=?",
+                (schedule["scheduled_shift_start"], schedule["scheduled_shift_end"], schedule["scheduled_grace_minutes"], now_iso(), row["id"]),
+            )
+
         latest = conn.execute("SELECT * FROM attendance WHERE id=?", (row["id"],)).fetchone()
         if latest["login_time"] and latest["logout_time"]:
             recalc_attendance(conn, int(row["id"]))
@@ -1209,6 +1824,197 @@ def admin_attendance_edit():
         new = dict(conn.execute("SELECT * FROM attendance WHERE id=?", (row["id"],)).fetchone())
         conn.commit()
     return jsonify({"message": "Attendance updated", "item": new})
+
+
+@app.post("/api/admin/attendance/bulk-add")
+@api_guard("ADMIN")
+def admin_attendance_bulk_add():
+    d = request.get_json(silent=True) or {}
+    code = str(d.get("employee_code", "")).strip()
+    entries = d.get("entries")
+    if not code:
+        return jsonify({"message": "employee_code is required"}), 400
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"message": "entries must be a non-empty array"}), 400
+    if len(entries) > 500:
+        return jsonify({"message": "Maximum 500 entries allowed per request"}), 400
+
+    normalized = []
+    for idx, raw in enumerate(entries, start=1):
+        row = raw or {}
+        attendance_date = str(row.get("attendance_date", "")).strip()
+        if not attendance_date:
+            return jsonify({"message": f"attendance_date is required at row {idx}"}), 400
+        try:
+            date.fromisoformat(attendance_date)
+        except Exception:
+            return jsonify({"message": f"Invalid attendance_date at row {idx}"}), 400
+
+        login_time = row.get("login_time")
+        logout_time = row.get("logout_time")
+        if login_time:
+            try:
+                parse_dt(login_time)
+            except Exception:
+                return jsonify({"message": f"Invalid login_time at row {idx}"}), 400
+        if logout_time:
+            try:
+                parse_dt(logout_time)
+            except Exception:
+                return jsonify({"message": f"Invalid logout_time at row {idx}"}), 400
+
+        break_taken = row.get("break_taken", 1)
+        if isinstance(break_taken, bool):
+            break_taken = int(break_taken)
+        elif isinstance(break_taken, (int, float)) and int(break_taken) in {0, 1}:
+            break_taken = int(break_taken)
+        elif isinstance(break_taken, str) and break_taken.strip().lower() in {"0", "1", "true", "false", "yes", "no"}:
+            break_taken = 1 if break_taken.strip().lower() in {"1", "true", "yes"} else 0
+        else:
+            return jsonify({"message": f"break_taken must be true/false at row {idx}"}), 400
+
+        category_id = row.get("category_id")
+        if category_id in {"", None}:
+            category_id = None
+        else:
+            try:
+                category_id = int(category_id)
+            except Exception:
+                return jsonify({"message": f"category_id must be an integer at row {idx}"}), 400
+            if category_id < 1:
+                return jsonify({"message": f"category_id must be >= 1 at row {idx}"}), 400
+
+        shift_id = row.get("shift_id")
+        if shift_id in {"", None}:
+            shift_id = None
+        else:
+            try:
+                shift_id = int(shift_id)
+            except Exception:
+                return jsonify({"message": f"shift_id must be an integer at row {idx}"}), 400
+            if shift_id < 1:
+                return jsonify({"message": f"shift_id must be >= 1 at row {idx}"}), 400
+
+        normalized.append(
+            {
+                "attendance_date": attendance_date,
+                "login_time": login_time if login_time else None,
+                "logout_time": logout_time if logout_time else None,
+                "break_taken": break_taken,
+                "category_id": category_id,
+                "shift_id": shift_id,
+            }
+        )
+
+    processed = []
+    with conn_db() as conn:
+        user = conn.execute("SELECT id FROM users WHERE employee_code=?", (code,)).fetchone()
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+        user_id = int(user["id"])
+
+        category_ids = sorted({item["category_id"] for item in normalized if item["category_id"] is not None})
+        if category_ids:
+            placeholders = ",".join("?" for _ in category_ids)
+            found_category_ids = {
+                int(r["id"])
+                for r in conn.execute(f"SELECT id FROM employee_categories WHERE id IN ({placeholders})", tuple(category_ids)).fetchall()
+            }
+            missing_categories = [x for x in category_ids if x not in found_category_ids]
+            if missing_categories:
+                return jsonify({"message": f"Category not found: {missing_categories[0]}"}), 404
+
+        shift_ids = sorted({item["shift_id"] for item in normalized if item["shift_id"] is not None})
+        if shift_ids:
+            placeholders = ",".join("?" for _ in shift_ids)
+            found_shift_ids = {int(r["id"]) for r in conn.execute(f"SELECT id FROM shifts WHERE id IN ({placeholders})", tuple(shift_ids)).fetchall()}
+            missing_shifts = [x for x in shift_ids if x not in found_shift_ids]
+            if missing_shifts:
+                return jsonify({"message": f"Shift not found: {missing_shifts[0]}"}), 404
+        try:
+            for item in normalized:
+                if item["category_id"] is not None or item["shift_id"] is not None:
+                    fields = []
+                    params = []
+                    if item["category_id"] is not None:
+                        fields.append("category_id=?")
+                        params.append(item["category_id"])
+                    if item["shift_id"] is not None:
+                        fields.append("shift_id=?")
+                        params.append(item["shift_id"])
+                    params.append(user_id)
+                    conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id=?", tuple(params))
+
+                existing = conn.execute(
+                    "SELECT id FROM attendance WHERE user_id=? AND attendance_date=?",
+                    (user_id, item["attendance_date"]),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        """
+                        UPDATE attendance
+                        SET login_time=?,logout_time=?,login_method='ADMIN_MANUAL',break_taken=?,status='PRESENT',updated_at=?,system_logout=0
+                        WHERE id=?
+                        """,
+                        (
+                            item["login_time"],
+                            item["logout_time"],
+                            item["break_taken"],
+                            now_iso(),
+                            int(existing["id"]),
+                        ),
+                    )
+                    attendance_id = int(existing["id"])
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO attendance
+                        (user_id,attendance_date,login_time,login_method,logout_time,total_hours,overtime,late_mark,break_taken,status,system_logout,created_at,updated_at)
+                        VALUES (?,?,?,?,?,NULL,NULL,0,?,'PRESENT',0,?,?)
+                        """,
+                        (
+                            user_id,
+                            item["attendance_date"],
+                            item["login_time"],
+                            "ADMIN_MANUAL",
+                            item["logout_time"],
+                            item["break_taken"],
+                            now_iso(),
+                            now_iso(),
+                        ),
+                    )
+                    attendance_id = int(cur.lastrowid)
+
+                latest_attendance = conn.execute("SELECT * FROM attendance WHERE id=?", (attendance_id,)).fetchone()
+                if latest_attendance and (
+                    item["shift_id"] is not None
+                    or not latest_attendance["scheduled_shift_start"]
+                    or not latest_attendance["scheduled_shift_end"]
+                    or latest_attendance["scheduled_grace_minutes"] is None
+                ):
+                    schedule_profile = profile_for_attendance(conn, user_id)
+                    schedule = snapshot_schedule_fields(schedule_profile)
+                    conn.execute(
+                        "UPDATE attendance SET scheduled_shift_start=?,scheduled_shift_end=?,scheduled_grace_minutes=?,updated_at=? WHERE id=?",
+                        (schedule["scheduled_shift_start"], schedule["scheduled_shift_end"], schedule["scheduled_grace_minutes"], now_iso(), attendance_id),
+                    )
+
+                latest = conn.execute("SELECT id,login_time,logout_time FROM attendance WHERE id=?", (attendance_id,)).fetchone()
+                if latest["login_time"] and latest["logout_time"]:
+                    recalc_attendance(conn, attendance_id)
+                else:
+                    conn.execute(
+                        "UPDATE attendance SET total_hours=NULL,overtime=NULL,late_mark=0,updated_at=? WHERE id=?",
+                        (now_iso(), attendance_id),
+                    )
+                processed.append({"attendance_id": attendance_id, "attendance_date": item["attendance_date"]})
+            conn.commit()
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
+            return jsonify({"message": str(e)}), 400
+    return jsonify({"message": "Bulk attendance entries saved", "employee_code": code, "count": len(processed), "items": processed})
 
 
 @app.get("/api/employee/my-attendance")
@@ -1268,6 +2074,53 @@ def my_summary():
     return jsonify(dict(row))
 
 
+@app.get("/api/employee/shifts")
+@api_guard("EMPLOYEE")
+def employee_shifts_list():
+    """Return all admin-created shifts for the employee shift selector."""
+    u = request.current_user
+    with conn_db() as conn:
+        profile = user_profile(conn, int(u["id"]))
+        if not profile:
+            return jsonify({"message": "User not found or inactive"}), 404
+        rows = conn.execute(
+            "SELECT id,name,start_time,end_time,grace_minutes FROM shifts ORDER BY id"
+        ).fetchall()
+    current_shift_id = int(profile["shift_id"]) if profile["shift_id"] is not None else None
+    return jsonify({"items": to_items(rows), "current_shift_id": current_shift_id})
+
+
+@app.put("/api/employee/my-shift")
+@api_guard("EMPLOYEE")
+def employee_shift_update():
+    """Save an employee-selected shift after checking it is still admin-created."""
+    u = request.current_user
+    data = request.get_json(silent=True) or {}
+    try:
+        shift_id = int(data.get("shift_id"))
+    except (TypeError, ValueError):
+        return jsonify({"message": "shift_id must be a valid shift"}), 400
+    if shift_id <= 0:
+        return jsonify({"message": "shift_id must be a valid shift"}), 400
+
+    with conn_db() as conn:
+        shift = conn.execute(
+            "SELECT id,name,start_time,end_time,grace_minutes FROM shifts WHERE id=?",
+            (shift_id,),
+        ).fetchone()
+        if not shift:
+            return jsonify({"message": "Selected shift is no longer available"}), 400
+        conn.execute("UPDATE users SET shift_id=? WHERE id=? AND active=1", (shift_id, int(u["id"])))
+        conn.commit()
+
+    return jsonify(
+        {
+            "message": "Shift selection saved. It will apply to your next attendance login.",
+            "shift": dict(shift),
+        }
+    )
+
+
 @app.get("/api/employee/today-break")
 @api_guard("EMPLOYEE")
 def employee_today_break():
@@ -1319,23 +2172,83 @@ def users_list():
 @app.post("/api/admin/users")
 @api_guard("ADMIN")
 def users_create():
-    d = request.get_json(silent=True) or {}
-    name = str(d.get("name", "")).strip()
-    role = str(d.get("role", "EMPLOYEE")).strip().upper()
-    code = str(d.get("employee_code", "")).strip()
-    pin = str(d.get("pin", "")).strip()
-    if not name or role not in {"ADMIN", "EMPLOYEE"} or not code or not valid_pin(pin):
+    parsed = parse_admin_user_payload(request.get_json(silent=True))
+    if not parsed:
         return jsonify({"message": "Invalid user payload"}), 400
-    cid = int(d.get("category_id", 1))
-    sid = int(d.get("shift_id", 1))
-    active = int(d.get("active", 1))
     with conn_db() as conn:
         try:
-            cur = conn.execute("INSERT INTO users (name,role,employee_code,pin_hash,pin_plain,category_id,shift_id,category_hours,active,created_at) VALUES (?,?,?,?,?,?,?,9,?,?)", (name, role, code, generate_password_hash(pin), pin, cid, sid, active, now_iso()))
+            cur = conn.execute(
+                "INSERT INTO users (name,role,employee_code,pin_hash,pin_plain,category_id,shift_id,category_hours,active,created_at) VALUES (?,?,?,?,?,?,?,9,?,?)",
+                (
+                    parsed["name"],
+                    parsed["role"],
+                    parsed["employee_code"],
+                    generate_password_hash(parsed["pin"]),
+                    parsed["pin"],
+                    parsed["category_id"],
+                    parsed["shift_id"],
+                    parsed["active"],
+                    now_iso(),
+                ),
+            )
             conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "User created", "id": int(cur.lastrowid)})
+
+
+@app.post("/api/admin/users/bulk")
+@api_guard("ADMIN")
+def users_create_bulk():
+    d = request.get_json(silent=True) or {}
+    entries = d.get("users")
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"message": "users must be a non-empty array"}), 400
+    if len(entries) > 500:
+        return jsonify({"message": "Maximum 500 users allowed per bulk request"}), 400
+
+    parsed_entries = []
+    seen_codes = set()
+    for idx, raw in enumerate(entries, start=1):
+        parsed = parse_admin_user_payload(raw)
+        if not parsed:
+            return jsonify({"message": f"Invalid user payload at row {idx}"}), 400
+        code_key = parsed["employee_code"].upper()
+        if code_key in seen_codes:
+            return jsonify({"message": f"Duplicate employee_code in request at row {idx}: {parsed['employee_code']}"}), 400
+        seen_codes.add(code_key)
+        parsed_entries.append(parsed)
+
+    created = []
+    created_at = now_iso()
+    with conn_db() as conn:
+        try:
+            for entry in parsed_entries:
+                cur = conn.execute(
+                    "INSERT INTO users (name,role,employee_code,pin_hash,pin_plain,category_id,shift_id,category_hours,active,created_at) VALUES (?,?,?,?,?,?,?,9,?,?)",
+                    (
+                        entry["name"],
+                        entry["role"],
+                        entry["employee_code"],
+                        generate_password_hash(entry["pin"]),
+                        entry["pin"],
+                        entry["category_id"],
+                        entry["shift_id"],
+                        entry["active"],
+                        created_at,
+                    ),
+                )
+                created.append({"id": int(cur.lastrowid), "employee_code": entry["employee_code"]})
+            conn.commit()
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
+            return jsonify({"message": str(e)}), 400
+    return jsonify({"message": "Bulk users created", "created_count": len(created), "created": created})
 
 
 @app.put("/api/admin/users/<int:user_id>")
@@ -1365,7 +2278,10 @@ def users_update(user_id):
         try:
             conn.execute(f"UPDATE users SET {', '.join(fields)} WHERE id=?", tuple(params))
             conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "User updated"})
 
@@ -1410,7 +2326,10 @@ def categories_create():
     with conn_db() as conn:
         try:
             cur = conn.execute("INSERT INTO employee_categories (name,required_hours) VALUES (?,?)", (name, req)); conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Category created", "id": int(cur.lastrowid)})
 
@@ -1427,7 +2346,10 @@ def categories_update(category_id):
     with conn_db() as conn:
         try:
             conn.execute(f"UPDATE employee_categories SET {', '.join(fields)} WHERE id=?", tuple(params)); conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Category updated"})
 
@@ -1468,7 +2390,10 @@ def shifts_create():
     with conn_db() as conn:
         try:
             cur = conn.execute("INSERT INTO shifts (name,start_time,end_time,grace_minutes) VALUES (?,?,?,?)", (name, st, et, g)); conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Shift created", "id": int(cur.lastrowid)})
 
@@ -1487,7 +2412,10 @@ def shifts_update(shift_id):
     with conn_db() as conn:
         try:
             conn.execute(f"UPDATE shifts SET {', '.join(fields)} WHERE id=?", tuple(params)); conn.commit()
-        except sqlite3.IntegrityError as e:
+        except Exception as e:
+            if not is_constraint_error(e):
+                raise
+            conn.rollback()
             return jsonify({"message": str(e)}), 400
     return jsonify({"message": "Shift updated"})
 
@@ -1512,12 +2440,20 @@ def recalc_attendance(conn, attendance_id):
     a = conn.execute("SELECT * FROM attendance WHERE id=?", (attendance_id,)).fetchone()
     if not a or not a["login_time"] or not a["logout_time"]:
         return
-    p = user_profile(conn, int(a["user_id"]))
-    if not p:
-        return
+    p = profile_for_attendance(conn, int(a["user_id"]), a)
     m = calc_metrics(a["login_time"], a["logout_time"], p)
     conn.execute("UPDATE attendance SET total_hours=?,overtime=?,late_mark=?,status=?,updated_at=? WHERE id=?", (m["total_hours"], m["overtime"], m["late_mark"], m["status"], now_iso(), attendance_id))
 
+@app.get("/debug-files")
+def debug_files():
+    import os
+    from pathlib import Path
+
+    root = Path("/var/task")
+
+    return jsonify({
+        "root_contents": sorted(os.listdir("/var/task")),
+    })
 
 @app.get("/api/admin/export.xlsx")
 @api_guard("ADMIN")
@@ -1555,6 +2491,24 @@ def export_xlsx():
     out = io.BytesIO(); wb.save(out); out.seek(0)
     return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name=f"attendance_{dfrom.isoformat()}_{dto.isoformat()}.xlsx")
 
+@app.get("/admin.html")
+def admin_tool_page():
+    return redirect(url_for("scanner_page"))
+    
+@app.get("/scanner.js")
+def scanner_js():
+    return send_from_directory(STATIC_DIR, "scanner.js")
+
+@app.get("/employee.html")
+def employee_tool_page():
+    return render_template("employee.html")
+
+@app.get("/scanner")
+def scanner_page():
+    chk = scanner_access_check()
+    if chk:
+        return chk
+    return render_template("scanner.html")
 
 @app.get("/api/employee/export.xlsx")
 @api_guard("EMPLOYEE")
@@ -1591,8 +2545,32 @@ def export_my_attendance_xlsx():
     out.seek(0)
     return send_file(out, mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", as_attachment=True, download_name=f"my_attendance_{dfrom.isoformat()}_{dto.isoformat()}.xlsx")
 
-restore_db_from_github()
-init_db()
+
+def log_registered_routes():
+    routes = route_manifest()
+    app.logger.info("Registered Flask routes (%s): %s", len(routes), json.dumps(routes))
+
+
+def validate_turso_startup():
+    ensure_database_configuration()
+    app.logger.info("Turso Python driver diagnostics: package=libsql-client version=%s url_scheme=%s", libsql_client_version(), turso_url_scheme())
+    try:
+        with conn_db(initialize=False, prefer_request=False) as conn:
+            row = conn.execute("SELECT 1 AS ok").fetchone()
+        if not row or int(row["ok"]) != 1:
+            raise DatabaseConnectionError("Turso startup probe returned an unexpected result")
+        app.logger.info("Successfully connected to Turso database on startup; SELECT 1 result=%s", row["ok"])
+    except AppConfigError:
+        app.logger.exception("Turso startup configuration validation failed")
+        raise
+    except Exception as exc:
+        app.logger.exception("Turso startup connection validation failed")
+        raise DatabaseConnectionError("Unable to validate Turso database connection on startup") from exc
+
+
+log_runtime_configuration()
+validate_turso_startup()
+log_registered_routes()
 
 if __name__ == "__main__":
     host = os.getenv("FLASK_RUN_HOST", "0.0.0.0")

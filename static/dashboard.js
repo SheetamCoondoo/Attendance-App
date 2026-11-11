@@ -171,12 +171,30 @@ function kpiValue(v) {
   return v == null ? 0 : v;
 }
 
+function formatKpiLabel(key) {
+  const labels = {
+    absent_count: "Absent Count",
+    break_taken_days: "Break Taken Days",
+    late_count: "Late Count",
+    overtime_hours: "Overtime Hours",
+    present_count: "Present Count",
+    total_days: "Total Days",
+    total_days_worked: "Total Days Worked",
+    total_hours: "Total Hours",
+  };
+  return labels[key] || String(key || "").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function formatYesNo(value) {
+  return Number(value || 0) === 1 ? "Yes" : "No";
+}
+
 function renderOrderedKpis(el, obj, keys) {
   el.innerHTML = "";
   keys.forEach((k) => {
     const d = document.createElement("div");
     d.className = "kpi";
-    d.innerHTML = `<div class="muted">${k}</div><div><b>${kpiValue(obj && obj[k])}</b></div>`;
+    d.innerHTML = `<div class="muted">${formatKpiLabel(k)}</div><div><b>${kpiValue(obj && obj[k])}</b></div>`;
     el.appendChild(d);
   });
 }
@@ -252,7 +270,14 @@ async function doSessionLogout() {
 }
 
 const adminState = { users: [], categories: [], shifts: [] };
-const employeeState = { canUpdateBreak: false, isSavingBreak: false };
+const employeeState = {
+  canUpdateBreak: false,
+  isSavingBreak: false,
+  isSavingShift: false,
+  currentShiftId: null,
+  shifts: [],
+  profile: null,
+};
 
 async function doEmployeeLogout() {
   const breakSelect = qs("logoutBreakTaken");
@@ -317,13 +342,30 @@ function getMergedEmployeeCode() {
   return (qs("mergedEmployeeCode").value || "").trim();
 }
 
+function populateMergedEmployeeOptions() {
+  const select = qs("mergedEmployeeCode");
+  if (!select) return;
+  const current = (select.value || "ALL").trim();
+  let html = `<option value="ALL">All Employees</option>`;
+  (adminState.users || []).forEach((u) => {
+    const code = String(u.employee_code || "").trim();
+    if (!code) return;
+    html += `<option value="${code}">${code} - ${u.name || ""}</option>`;
+  });
+  select.innerHTML = html;
+  const exists = Array.from(select.options).some((opt) => opt.value === current);
+  select.value = exists ? current : "ALL";
+}
+
 function setMergedExportLink() {
   const code = getMergedEmployeeCode();
   const link = qs("mergedExportLink");
-  if (!code) {
+  if (!code || code.toUpperCase() === "ALL") {
     link.removeAttribute("href");
+    link.title = "XLSX export is available for individual employees only.";
     return;
   }
+  link.title = "";
   link.href = `/api/admin/employee-summary.xlsx?employee_code=${encodeURIComponent(code)}&${mergedRangeQuery()}`;
 }
 
@@ -346,6 +388,10 @@ async function loadAdmin() {
   qs("assignShiftForm").onsubmit = assignShiftToEmployee;
   qs("adminEditAttendanceForm").onsubmit = submitAdminAttendanceEdit;
   qs("loadAttendanceEditBtn").onclick = loadCurrentAttendanceEdit;
+  qs("adminBulkAttendanceForm").onsubmit = submitAdminBulkAttendance;
+  qs("bulkAttendanceAddRowBtn").onclick = () => addBulkAttendanceSlot();
+  qs("bulkAttendanceClearBtn").onclick = resetBulkAttendanceSlots;
+  resetBulkAttendanceSlots();
 
   await Promise.all([fetchCategories(), fetchShifts()]);
   await Promise.all([fetchUsers(), loadTodayAttendance()]);
@@ -354,27 +400,26 @@ async function loadAdmin() {
 
 async function loadMergedEmployeeView() {
   const code = getMergedEmployeeCode();
-  if (!code) {
-    alert("Enter employee code");
-    return;
-  }
   try {
-    const d = await api(`/api/admin/employee-summary?employee_code=${encodeURIComponent(code)}&${mergedRangeQuery()}`);
+    const allSelected = !code || code.toUpperCase() === "ALL";
+    const d = allSelected
+      ? await api(`/api/admin/employee-summary-all?${mergedRangeQuery()}`)
+      : await api(`/api/admin/employee-summary?employee_code=${encodeURIComponent(code)}&${mergedRangeQuery()}`);
 
     const summary = d.summary || {};
     renderOrderedKpis(qs("mergedSummary"), {
       absent_count: summary.absent_count,
-      total_hours: summary.total_hours,
-      overtime_hours: summary.overtime_hours,
       total_days_worked: summary.total_days_worked,
       late_count: summary.late_count,
-    }, ["absent_count", "total_hours", "overtime_hours", "total_days_worked", "late_count"]);
+      total_hours: summary.total_hours,
+      overtime_hours: summary.overtime_hours,
+    }, ["absent_count", "total_days_worked", "late_count", "total_hours", "overtime_hours"]);
 
     const tb = qs("mergedAttendanceTable").querySelector("tbody");
     tb.innerHTML = "";
     (d.attendance || []).forEach((i) => {
       const tr = document.createElement("tr");
-      tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${i.login_method || "-"}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${kpiValue(i.late_mark)}</td><td>${Number(i.break_taken || 0) === 1 ? "Yes" : "No"}</td>`;
+      tr.innerHTML = `<td>${i.employee_code || (allSelected ? "" : code)}</td><td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${i.login_method || "-"}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${formatYesNo(i.late_mark)}</td><td>${formatYesNo(i.break_taken)}</td>`;
       tb.appendChild(tr);
     });
     setMergedExportLink();
@@ -393,7 +438,7 @@ async function loadTodayAttendance() {
   tb.innerHTML = "";
   (d.items || []).forEach((i) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${i.employee_code || ""}</td><td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${i.login_method || "-"}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${kpiValue(i.late_mark)}</td><td>${Number(i.break_taken || 0) === 1 ? "Yes" : "No"}</td>`;
+    tr.innerHTML = `<td>${i.employee_code || ""}</td><td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${i.login_method || "-"}</td><td>${kpiValue(i.total_hours)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${formatYesNo(i.late_mark)}</td><td>${formatYesNo(i.break_taken)}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -470,6 +515,7 @@ async function fetchUsers() {
 
   fillSelect(qs("uCategory"), adminState.categories, "id", "name");
   fillSelect(qs("uShift"), adminState.shifts, "id", "name");
+  populateMergedEmployeeOptions();
 }
 
 async function createUser(e) {
@@ -487,6 +533,156 @@ async function createUser(e) {
   });
   e.target.reset();
   await fetchUsers();
+}
+
+function setBulkAttendanceMessage(message, isError = false) {
+  const el = qs("bulkAttendanceResult");
+  if (!el) return;
+  el.textContent = message || "";
+  el.style.color = isError ? "#b91c1c" : "";
+}
+
+function createBulkAttendanceSlot(data = {}) {
+  const selectedCategoryId = data.category_id == null ? "" : String(data.category_id);
+  const selectedShiftId = data.shift_id == null ? "" : String(data.shift_id);
+  const wrapper = document.createElement("div");
+  wrapper.className = "bulk-attendance-slot";
+  wrapper.innerHTML = `
+    <div class="row wrap">
+      <input data-k="employee_code" placeholder="Employee Code (e.g. EMP001)" value="${data.employee_code || ""}" />
+      <input data-k="attendance_date" type="date" title="Attendance date" value="${data.attendance_date || ""}" />
+      <input data-k="login_time" type="datetime-local" title="Login date and time" value="${data.login_time || ""}" />
+      <input data-k="logout_time" type="datetime-local" title="Logout date and time" value="${data.logout_time || ""}" />
+      <select data-k="category_id" title="Category override for this slot">
+        <option value="">Category (No Change)</option>
+        ${options(adminState.categories, "id", "name", selectedCategoryId)}
+      </select>
+      <select data-k="shift_id" title="Shift override for this slot">
+        <option value="">Shift (No Change)</option>
+        ${options(adminState.shifts, "id", "name", selectedShiftId)}
+      </select>
+      <select data-k="break_taken" title="Break taken">
+        <option value="1" ${(data.break_taken == null || Number(data.break_taken) === 1) ? "selected" : ""}>Break Taken = Yes</option>
+        <option value="0" ${Number(data.break_taken) === 0 ? "selected" : ""}>Break Taken = No</option>
+      </select>
+      <button type="button" data-role="remove-slot">Remove</button>
+    </div>
+  `;
+  wrapper.querySelector('[data-role="remove-slot"]').onclick = () => {
+    const container = qs("bulkAttendanceSlots");
+    wrapper.remove();
+    if (container && !container.children.length) addBulkAttendanceSlot();
+  };
+  return wrapper;
+}
+
+function syncBulkSlotSelectOptions() {
+  const container = qs("bulkAttendanceSlots");
+  const rows = Array.from(container ? container.querySelectorAll(".bulk-attendance-slot") : []);
+  rows.forEach((slot) => {
+    const categorySelect = slot.querySelector('[data-k="category_id"]');
+    if (categorySelect) {
+      const selected = categorySelect.value || "";
+      categorySelect.innerHTML = `<option value="">Category (No Change)</option>${options(adminState.categories, "id", "name", selected)}`;
+    }
+
+    const shiftSelect = slot.querySelector('[data-k="shift_id"]');
+    if (shiftSelect) {
+      const selected = shiftSelect.value || "";
+      shiftSelect.innerHTML = `<option value="">Shift (No Change)</option>${options(adminState.shifts, "id", "name", selected)}`;
+    }
+  });
+}
+
+function addBulkAttendanceSlot(data = {}) {
+  const container = qs("bulkAttendanceSlots");
+  if (!container) return;
+  container.appendChild(createBulkAttendanceSlot(data));
+}
+
+function resetBulkAttendanceSlots() {
+  const container = qs("bulkAttendanceSlots");
+  if (!container) return;
+  container.innerHTML = "";
+  addBulkAttendanceSlot({
+    attendance_date: todayIso(),
+    break_taken: 1,
+  });
+}
+
+function parseBulkAttendanceSlots() {
+  const container = qs("bulkAttendanceSlots");
+  const rows = Array.from(container ? container.querySelectorAll(".bulk-attendance-slot") : []);
+  const grouped = new Map();
+
+  rows.forEach((slot, idx) => {
+    const line = idx + 1;
+    const employee_code = (slot.querySelector('[data-k="employee_code"]').value || "").trim();
+    const attendance_date = (slot.querySelector('[data-k="attendance_date"]').value || "").trim();
+    const login_time = (slot.querySelector('[data-k="login_time"]').value || "").trim();
+    const logout_time = (slot.querySelector('[data-k="logout_time"]').value || "").trim();
+    const category_id_raw = (slot.querySelector('[data-k="category_id"]').value || "").trim();
+    const shift_id_raw = (slot.querySelector('[data-k="shift_id"]').value || "").trim();
+    const break_taken = Number(slot.querySelector('[data-k="break_taken"]').value);
+    const category_id = category_id_raw === "" ? null : Number(category_id_raw);
+    const shift_id = shift_id_raw === "" ? null : Number(shift_id_raw);
+    if (!employee_code) throw new Error(`Employee code is required at slot ${line}.`);
+    if (!attendance_date) throw new Error(`Attendance date is required at slot ${line}.`);
+    if (Number.isNaN(break_taken) || ![0, 1].includes(break_taken)) {
+      throw new Error(`Break value must be Yes or No at slot ${line}.`);
+    }
+    if (category_id_raw !== "" && (!Number.isInteger(category_id) || category_id <= 0)) {
+      throw new Error(`Category must be selected from the list at slot ${line}.`);
+    }
+    if (shift_id_raw !== "" && (!Number.isInteger(shift_id) || shift_id <= 0)) {
+      throw new Error(`Shift must be selected from the list at slot ${line}.`);
+    }
+    if (!grouped.has(employee_code)) grouped.set(employee_code, []);
+    grouped.get(employee_code).push({
+      attendance_date,
+      login_time: login_time || null,
+      logout_time: logout_time || null,
+      break_taken,
+      category_id,
+      shift_id,
+    });
+  });
+
+  return grouped;
+}
+
+async function submitAdminBulkAttendance(e) {
+  e.preventDefault();
+  try {
+    setBulkAttendanceMessage("");
+    const groupedEntries = parseBulkAttendanceSlots();
+    if (!groupedEntries.size) {
+      alert("Please enter at least one attendance slot.");
+      return;
+    }
+
+    let totalSaved = 0;
+    const savedEmployeeCodes = [];
+    for (const [employeeCode, entries] of groupedEntries.entries()) {
+      const result = await api("/api/admin/attendance/bulk-add", {
+        method: "POST",
+        body: JSON.stringify({ employee_code: employeeCode, entries }),
+      });
+      totalSaved += Number(result.count || entries.length);
+      savedEmployeeCodes.push(employeeCode);
+    }
+
+    setBulkAttendanceMessage(`Saved ${totalSaved} attendance entries for ${savedEmployeeCodes.length} employee(s).`);
+    resetBulkAttendanceSlots();
+    await Promise.all([loadTodayAttendance(), fetchUsers()]);
+    const selectedCode = getMergedEmployeeCode().toUpperCase();
+    if (selectedCode !== "ALL" && savedEmployeeCodes.some((code) => selectedCode === code.toUpperCase())) {
+      await loadMergedEmployeeView();
+    }
+  } catch (err) {
+    setBulkAttendanceMessage(err.message || "Unable to save bulk attendance.", true);
+    alert(err.message || "Unable to save bulk attendance.");
+  }
 }
 
 async function fetchCategories() {
@@ -541,6 +737,7 @@ async function fetchCategories() {
 
   fillSelect(qs("uCategory"), adminState.categories, "id", "name");
   fillSelect(qs("editCategoryId"), adminState.categories, "id", "name", "Category (No Change)");
+  syncBulkSlotSelectOptions();
 }
 
 async function createCategory(e) {
@@ -610,6 +807,7 @@ async function fetchShifts() {
   fillSelect(qs("uShift"), adminState.shifts, "id", "name");
   fillSelect(qs("assignShiftId"), adminState.shifts, "id", "name");
   fillSelect(qs("editShiftId"), adminState.shifts, "id", "name", "Shift (No Change)");
+  syncBulkSlotSelectOptions();
 }
 
 async function createShift(e) {
@@ -710,12 +908,111 @@ function renderEmployeeProfile(user) {
   if (shiftEl) shiftEl.textContent = shiftTimings;
 }
 
+function setEmployeeShiftMessage(message) {
+  const statusText = qs("employeeShiftMsg");
+  if (statusText) statusText.textContent = message;
+}
+
+function employeeShiftLabel(shift) {
+  const name = String((shift && shift.name) || "Shift").trim() || "Shift";
+  const start = String((shift && shift.start_time) || "").trim();
+  const end = String((shift && shift.end_time) || "").trim();
+  return start && end ? `${name} (${start} - ${end})` : name;
+}
+
+function renderEmployeeShiftChoices(shifts, selectedId) {
+  const select = qs("employeeShiftId");
+  if (!select) return;
+  select.replaceChildren();
+  (shifts || []).forEach((shift) => {
+    const option = document.createElement("option");
+    option.value = String(shift.id);
+    option.textContent = employeeShiftLabel(shift);
+    option.selected = String(shift.id) === String(selectedId);
+    select.appendChild(option);
+  });
+}
+
+async function loadEmployeeShiftChoices(currentUser) {
+  const select = qs("employeeShiftId");
+  const saveBtn = qs("saveEmployeeShiftBtn");
+  if (!select || !saveBtn) return;
+
+  select.disabled = true;
+  saveBtn.disabled = true;
+  try {
+    const data = await api("/api/employee/shifts");
+    const shifts = Array.isArray(data.items) ? data.items : [];
+    if (!shifts.length) throw new Error("No shifts are available. Ask an administrator to create a shift.");
+
+    const selectedId = data.current_shift_id ?? (currentUser && currentUser.shift_id);
+    employeeState.shifts = shifts;
+    employeeState.currentShiftId = selectedId == null ? null : Number(selectedId);
+    renderEmployeeShiftChoices(shifts, selectedId);
+    select.disabled = false;
+    saveBtn.disabled = false;
+    setEmployeeShiftMessage("Your admin-assigned shift is selected by default. A saved selection applies to your next attendance login.");
+  } catch (error) {
+    employeeState.shifts = [];
+    employeeState.currentShiftId = null;
+    select.replaceChildren();
+    const option = document.createElement("option");
+    option.textContent = "Shifts unavailable";
+    select.appendChild(option);
+    setEmployeeShiftMessage(`Unable to load shifts: ${error.message}`);
+  }
+}
+
+async function saveEmployeeShift() {
+  const select = qs("employeeShiftId");
+  const saveBtn = qs("saveEmployeeShiftBtn");
+  if (!select || !saveBtn || employeeState.isSavingShift) return;
+
+  const shiftId = Number(select.value);
+  if (!Number.isInteger(shiftId) || shiftId <= 0) {
+    setEmployeeShiftMessage("Please select a valid shift.");
+    select.focus();
+    return;
+  }
+
+  employeeState.isSavingShift = true;
+  select.disabled = true;
+  saveBtn.disabled = true;
+  try {
+    const data = await api("/api/employee/my-shift", {
+      method: "PUT",
+      body: JSON.stringify({ shift_id: shiftId }),
+    });
+    const shift = data.shift || employeeState.shifts.find((item) => Number(item.id) === shiftId);
+    employeeState.currentShiftId = shiftId;
+    if (shift) {
+      employeeState.profile = {
+        ...(employeeState.profile || {}),
+        shift_id: shiftId,
+        shift_name: shift.name,
+        shift_start: shift.start_time,
+        shift_end: shift.end_time,
+      };
+      renderEmployeeProfile(employeeState.profile);
+    }
+    setEmployeeShiftMessage(data.message || "Shift selection saved. It will apply to your next attendance login.");
+  } catch (error) {
+    setEmployeeShiftMessage(`Unable to save shift: ${error.message}`);
+    alert(`Could not save shift: ${error.message}`);
+  } finally {
+    employeeState.isSavingShift = false;
+    select.disabled = false;
+    saveBtn.disabled = false;
+  }
+}
+
 async function loadEmployee(currentUser) {
   let user = currentUser;
   if (!user || !user.category_name || !user.shift_start || !user.shift_end) {
     const me = await api("/auth/me");
     user = me.user || user;
   }
+  employeeState.profile = user;
   renderEmployeeProfile(user);
 
   const r = monthRange();
@@ -724,7 +1021,8 @@ async function loadEmployee(currentUser) {
   qs("reloadAttendance").onclick = reloadEmployeeDashboard;
   qs("logoutBtn").onclick = doEmployeeLogout;
   qs("saveBreakBtn").onclick = saveEmployeeBreakStatus;
-  await reloadEmployeeDashboard();
+  qs("saveEmployeeShiftBtn").onclick = saveEmployeeShift;
+  await Promise.all([loadEmployeeShiftChoices(user), reloadEmployeeDashboard()]);
 }
 
 async function loadEmployeeBreakStatus() {
@@ -786,7 +1084,7 @@ async function fetchEmployeeAttendance() {
   tb.innerHTML = "";
   (d.items || []).forEach((i) => {
     const tr = document.createElement("tr");
-    tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${kpiValue(i.late_mark)}</td><td>${(i.break_taken || 0) === 1 ? "Yes" : "No"}</td><td>${i.status || ""}</td>`;
+    tr.innerHTML = `<td>${i.attendance_date || ""}</td><td>${formatDashboardDateTime(i.login_time)}</td><td>${formatDashboardDateTime(i.logout_time)}</td><td>${kpiValue(i.overtime)}</td><td>${formatHoursToHHMM(i.early_logout_hours)}</td><td>${formatYesNo(i.late_mark)}</td><td>${formatYesNo(i.break_taken)}</td><td>${i.status || ""}</td>`;
     tb.appendChild(tr);
   });
 }
@@ -806,4 +1104,3 @@ window.addEventListener("DOMContentLoaded", async () => {
     else alert(e.message);
   }
 });
-

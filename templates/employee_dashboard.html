@@ -65,13 +65,28 @@
         <p id="breakStatusMsg" class="muted">Save break status anytime. Logout can also save selected value optionally.</p>
       </div>
     </section>
+    <section class="card dashboard-card span-4" data-widget-id="employee-shift-selection">
+      <div class="card-header">
+        <h3>My Shift</h3>
+      </div>
+      <div class="dashboard-card-body">
+        <label for="employeeShiftId">Select a shift</label>
+        <div class="row wrap">
+          <select id="employeeShiftId" aria-describedby="employeeShiftMsg" disabled>
+            <option>Loading shifts...</option>
+          </select>
+          <button id="saveEmployeeShiftBtn" type="button" disabled>Save Shift</button>
+        </div>
+        <p id="employeeShiftMsg" class="muted">Your admin-assigned shift is selected by default. A saved selection applies to your next attendance login.</p>
+      </div>
+    </section>
     <section class="card dashboard-card span-12" data-widget-id="employee-attendance">
       <div class="card-header">
         <h3>My Attendance</h3>
       </div>
       <div class="dashboard-card-body">
         <div class="row wrap"><input id="fromDate" type="date" /><input id="toDate" type="date" /><button id="reloadAttendance">Load</button><a id="myExportLink" href="#" target="_blank" rel="noopener">Download XLSX</a></div>
-        <div class="table-wrapper table-scroll"><table id="attendanceTable"><thead><tr><th>Date</th><th>Login</th><th>Logout</th><th>OT(Hrs)</th><th>Early Logout Time</th><th>Late(Count)</th><th>Break</th><th>Status</th></tr></thead><tbody></tbody></table></div>
+        <div class="table-wrapper table-scroll"><table id="attendanceTable"><thead><tr><th>Date</th><th>Login</th><th>Logout</th><th>OT(Hrs)</th><th>Early Logout Time</th><th>Late</th><th>Break</th><th>Status</th></tr></thead><tbody></tbody></table></div>
       </div>
     </section>
     </div>

@@ -1,7 +1,7 @@
 # Attendance App
 
 On-prem attendance system with:
-- Flask backend + SQLite
+- Flask backend + Turso libSQL
 - PIN authentication (Admin/Employee)
 - Admin dashboard (attendance, users, categories, shifts, approvals, audit, XLSX export)
 - Employee dashboard (summary, history, edit requests)
@@ -20,6 +20,8 @@ Or manual:
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
+$env:TURSO_DATABASE_URL = "libsql://your-database-name-your-org.turso.io"
+$env:TURSO_AUTH_TOKEN = "replace-with-your-turso-auth-token"
 python app.py
 ```
 
@@ -47,6 +49,8 @@ cp .env.example .env
 Set at least:
 - `APP_ENV=production`
 - `SECRET_KEY=<long random value>`
+- `TURSO_DATABASE_URL=libsql://<your-db>.turso.io`
+- `TURSO_AUTH_TOKEN=<set in env vars>`
 - `TRUST_PROXY=1` (when running behind nginx)
 - `SESSION_COOKIE_SECURE=1` for HTTPS, or `0` for HTTP-only LAN usage
 
@@ -77,7 +81,7 @@ set +a
 .venv/bin/gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 wsgi:application
 ```
 
-`workers=1` is intentional because SQLite is used.
+`workers=1` is a conservative default. Because the database is remote, you can raise workers later if your host has enough CPU and memory.
 
 4. Install systemd service:
 
@@ -115,6 +119,8 @@ For a quick production run on Windows, the app now auto-switches to `waitress` w
 ```powershell
 $env:APP_ENV = "production"
 $env:SECRET_KEY = "<long-random-secret>"
+$env:TURSO_DATABASE_URL = "libsql://<your-db>.turso.io"
+$env:TURSO_AUTH_TOKEN = "<set-in-env>"
 $env:TRUST_PROXY = "1"  # set this only when behind reverse proxy
 .\.venv\Scripts\python.exe app.py
 ```
@@ -125,6 +131,48 @@ Or one command:
 $env:SECRET_KEY = "<long-random-secret>"
 .\run-prod.ps1
 ```
+
+## Deploy on Render
+
+If Render shows `No open HTTP ports detected on 0.0.0.0`, your start command is usually binding to `127.0.0.1` (or a fixed port) instead of Render's required host/port.
+
+Use this start command:
+
+```bash
+gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT wsgi:application
+```
+
+This repository includes a `render.yaml` blueprint with the correct settings. Import the repo in Render, or copy these values into your existing service:
+
+- **Build Command**: `pip install -r requirements.txt`
+- **Start Command**: `gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT wsgi:application`
+- **Environment**:
+  - `APP_ENV=production`
+  - `SECRET_KEY=<set in Render env vars>`
+  - `TURSO_DATABASE_URL=libsql://<your-db>.turso.io`
+  - `TURSO_AUTH_TOKEN=<set in Render env vars>`
+  - `SESSION_COOKIE_SECURE=1`
+
+## Deploy on Vercel
+
+Vercel can detect the root `app.py` Flask application automatically with zero custom build or routing steps. This repository's `vercel.json` only adjusts the function bundle and timeout; it does not override Flask routing or Vercel's normal `public/**` static-file handling.
+
+Set these environment variables in the Vercel project:
+
+- `APP_ENV=production`
+- `SECRET_KEY=<long random value>`
+- `TURSO_DATABASE_URL=libsql://<your-db>.turso.io`
+- `TURSO_AUTH_TOKEN=<set in Vercel env vars>`
+- `TRUST_PROXY=1`
+- `SESSION_COOKIE_SECURE=1`
+- `LOG_LEVEL=INFO`
+- `ENABLE_ROUTE_DEBUG=1` while diagnosing routes such as `/scanner`, `/scanner.js`, `/health`, or `/api/*`
+
+Operational notes:
+
+- `/health` now reports environment status, Turso connectivity, and public static-file availability.
+- `/routes` returns the registered Flask routes when `ENABLE_ROUTE_DEBUG=1`.
+- `REQUIRE_OFFICE_NETWORK` is optional and defaults to disabled so Vercel deployments are not blocked unexpectedly.
 
 ## URLs
 
@@ -146,7 +194,7 @@ $env:SECRET_KEY = "<long-random-secret>"
 - QR: `/generate-qr`, `/scan`
 - Midnight: `/admin/run-midnight-close`
 - Admin Data: `/api/admin/attendance`, `/api/admin/summary`
-- Employee Data: `/api/employee/my-attendance`, `/api/employee/my-summary`
+- Employee Data: `/api/employee/my-attendance`, `/api/employee/my-summary`, `/api/employee/shifts`, `/api/employee/my-shift`
 - Management: `/api/admin/users`, `/api/admin/categories`, `/api/admin/shifts`
 - Edit Workflow: `/api/employee/edit-requests`, `/api/admin/edit-requests`
 - Audit + Export: `/api/admin/audit`, `/api/admin/export.xlsx`
@@ -171,7 +219,19 @@ $env:SECRET_KEY = "<long-random-secret>"
   - Single-use
   - Expires with session TTL
   - Locked after 5 failed attempts
-  - Generating a new QR/OTP invalidates prior active code for that employee
+- Generating a new QR/OTP invalidates prior active code for that employee
+
+## Mobile and Tablet QR Scanning
+
+- The scanner page is responsive and requests the rear camera when available.
+- Serve the app over HTTPS in production: mobile browsers only allow camera access from a secure context.
+- A device scans a QR shown on another device; it cannot scan a QR displayed on its own screen.
+
+## Employee Shift Selection
+
+- The employee dashboard lists every shift created by an admin and preselects the employee's current admin-assigned shift.
+- Saving a different shift updates the employee's active shift for their next attendance login.
+- Attendance records retain their schedule snapshot, so changing a shift does not modify already-recorded attendance.
 
 ## Break Status Cutoff
 
